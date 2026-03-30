@@ -1,0 +1,2 @@
+/proxy/dropbox-image/*  https://paper-attachments.dropboxusercontent.com/:splat  200!
+/*  /index.html  200

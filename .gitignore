@@ -1,0 +1,67 @@
+# --- Python ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Node (source/) ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Build / 成果物（Vite / PyInstaller など） ---
+dist/
+build/
+*.egg
+
+# --- Desktop ---
+desktop/logs/
+
+# --- 環境変数・秘密 ---
+# ルート・サブディレクトリの .env / .env.*（VITE_* や OAuth 用）
+.env
+.env.*
+# テンプレート・サンプルは追跡する（上の .env.* より後に書く＝優先）
+!.env.example
+!.env.sample
+!.env.*.example
+
+# OAuth / GCP がダウンロードするクレデンシャル（リポジトリに入れない）
+credentials.json
+token.json
+client_secret.json
+*client_secret*.json
+
+# 秘密鍵・証明書（誤コミット防止）
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+id_ecdsa*
+*.key.pem
+
+# --- エディタ / IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db

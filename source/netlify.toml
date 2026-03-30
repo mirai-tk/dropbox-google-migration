@@ -1,0 +1,45 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+  functions = "netlify/functions"
+
+[[redirects]]
+  from = "/api/proxy-image"
+  to = "/.netlify/functions/proxy-image"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/api/google/token"
+  to = "/.netlify/functions/google-token"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/api/google/refresh"
+  to = "/.netlify/functions/google-refresh"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/api/dropbox/token"
+  to = "/.netlify/functions/dropbox-token"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/api/dropbox/refresh"
+  to = "/.netlify/functions/dropbox-refresh"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/proxy/dropbox-image/*"
+  to = "https://paper-attachments.dropboxusercontent.com/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
