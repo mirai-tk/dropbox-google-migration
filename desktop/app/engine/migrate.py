@@ -17,6 +17,7 @@ from ..dropbox_oauth_refresh import (
     dropbox_request_with_token_refresh,
     refresh_dropbox_access_token,
 )
+from ..desktop_notify import show_desktop_notification
 from ..google_docs_checklist import convert_task_markers_to_native_checklists
 from ..google_oauth_refresh import google_request_with_token_refresh
 from ..migration_auth import MigrationAuthError
@@ -27,8 +28,9 @@ logger = logging.getLogger(__name__)
 MIGRATION_POOL_SIZE = 5
 RESUMABLE_UPLOAD_THRESHOLD = 400 * 1024 * 1024
 RESUMABLE_CHUNK_SIZE = 256 * 1024
-# source/src/hooks/useConverter.js の GDRIVE_STREAM_THRESHOLD と同じ（multipart 全体がこれ以下なら単発 POST）
-GDRIVE_STREAM_THRESHOLD = 5 * 1024 * 1024
+RESUMABLE_CHUNK_PUT_RETRIES = 4
+RESUMABLE_CHUNK_PUT_TIMEOUT = 600.0
+# Web の GDRIVE_STREAM_THRESHOLD（5MB）と同じ閾値は useConverter.js にある。Python エンジンは常に multipart/related をチャンク送信し送信中バイトで UL 進捗を付ける。
 CHECKPOINT_EVERY = 50
 
 # GDrive への送信パターン（フロントの gUpload / migrateFolderRecursively と対応）
@@ -240,7 +242,8 @@ async def gdrive_delete_file(
     return r.is_success
 
 
-MULTIPART_UPLOAD_CHUNK = 64 * 1024
+# 小さめにすると related 送信の on_body_progress が細かくなり UL バーが飛びにくい
+MULTIPART_UPLOAD_CHUNK = 32 * 1024
 
 
 def _form_boundary_like_js() -> str:
@@ -273,7 +276,7 @@ def _multipart_related_upload_body(
     file_bytes: bytes,
     media_content_type: str,
 ) -> bytes:
-    """GDRIVE_STREAM_THRESHOLD 超: useConverter.js createMultipartStream と同じ related 構造。
+    """useConverter.js createMultipartStream と同じ related 構造。
 
     第2パートの Content-Type はメディア実体に合わせる（Docx 変換時は docx の MIME）。
     """
@@ -295,10 +298,9 @@ async def gdrive_multipart_upload(
     file_bytes: bytes,
     on_body_progress: Callable[[int, int], Awaitable[None]] | None = None,
 ) -> str | None:
-    """Drive uploadType=multipart。useConverter.gUpload と同じ分岐:
+    """Drive uploadType=multipart。multipart/related を httpx にチャンク供給し、送ったバイト数で進捗を付ける。
 
-    - 本体 ≤ GDRIVE_STREAM_THRESHOLD: FormData と同じ multipart/form-data（metadata + file）
-    - 超: createMultipartStream 相当の multipart/related（チャンク送信で進捗）
+    単発の files= FormData POST は送信中のバイトが取れないため使わない。
 
     成功時は作成ファイルの id を返す。失敗時は None。
     """
@@ -307,44 +309,7 @@ async def gdrive_multipart_upload(
         "?uploadType=multipart&supportsAllDrives=true"
     )
     meta_str = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
-    upload_fname, media_ct = _multipart_file_part_for_upload(metadata)
-    total_bytes = len(file_bytes)
-
-    # Web: 5MB 以下は FormData のみ（streams は使わない）
-    if total_bytes <= GDRIVE_STREAM_THRESHOLD:
-        if on_body_progress:
-            await on_body_progress(0, max(1, total_bytes))
-        files = {
-            "metadata": (None, meta_str, "application/json"),
-            "file": (upload_fname, file_bytes, media_ct),
-        }
-        r = await google_request_with_token_refresh(
-            client,
-            token_ref,
-            refresh,
-            lambda tok: client.post(
-                url,
-                headers={"Authorization": f"Bearer {tok}"},
-                files=files,
-                timeout=600.0,
-            ),
-        )
-        if not r.is_success:
-            logger.error(
-                "gdrive_multipart_upload (form-data) failed status=%s meta=%s body=%s",
-                r.status_code,
-                meta_str[:2000],
-                (r.text or "")[:4000],
-            )
-            return None
-        if on_body_progress:
-            await on_body_progress(total_bytes, max(1, total_bytes))
-        try:
-            data = r.json()
-            return data.get("id") if isinstance(data, dict) else None
-        except Exception:
-            logger.exception("gdrive_multipart_upload (form-data): JSON parse failed")
-            return None
+    _upload_fname, media_ct = _multipart_file_part_for_upload(metadata)
 
     boundary = _form_boundary_like_js()
     body = _multipart_related_upload_body(boundary, meta_str, file_bytes, media_ct)
@@ -378,7 +343,7 @@ async def gdrive_multipart_upload(
     )
     if not r.is_success:
         logger.error(
-            "gdrive_multipart_upload (related chunked) failed status=%s meta=%s body=%s",
+            "gdrive_multipart_upload (chunked) failed status=%s meta=%s body=%s",
             r.status_code,
             meta_str[:2000],
             (r.text or "")[:4000],
@@ -390,8 +355,55 @@ async def gdrive_multipart_upload(
         data = r.json()
         return data.get("id") if isinstance(data, dict) else None
     except Exception:
-        logger.exception("gdrive_multipart_upload (related): JSON parse failed")
+        logger.exception("gdrive_multipart_upload: JSON parse failed")
         return None
+
+
+async def _put_resumable_chunk(
+    client: httpx.AsyncClient,
+    token_ref: list[str],
+    refresh: str | None,
+    location: str,
+    piece: bytes,
+    content_range: str,
+) -> httpx.Response | None:
+    """resumable セッションへのチャンク PUT。応答受信前に切れる ReadError 等は再試行する。"""
+    delay = 1.5
+    for attempt in range(RESUMABLE_CHUNK_PUT_RETRIES):
+        try:
+            return await google_request_with_token_refresh(
+                client,
+                token_ref,
+                refresh,
+                lambda tok, p=piece, crn=content_range: client.put(
+                    location,
+                    headers={
+                        "Authorization": f"Bearer {tok}",
+                        "Content-Length": str(len(p)),
+                        "Content-Range": crn,
+                    },
+                    content=p,
+                    timeout=RESUMABLE_CHUNK_PUT_TIMEOUT,
+                ),
+            )
+        except httpx.TransportError as e:
+            if attempt >= RESUMABLE_CHUNK_PUT_RETRIES - 1:
+                logger.warning(
+                    "resumable chunk PUT failed after %d attempts: %s",
+                    RESUMABLE_CHUNK_PUT_RETRIES,
+                    e,
+                    exc_info=True,
+                )
+                return None
+            logger.info(
+                "resumable chunk PUT retry %d/%d: %s",
+                attempt + 1,
+                RESUMABLE_CHUNK_PUT_RETRIES,
+                e,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30.0)
+    return None
 
 
 async def gdrive_resumable_upload_stream(
@@ -441,29 +453,17 @@ async def gdrive_resumable_upload_stream(
             if take == 0:
                 break
             piece = bytes(buf[:take])
-            del buf[:take]
             range_end = min(offset + take, file_size)
             cr = f"bytes {offset}-{range_end - 1}/{file_size}"
-            r = await google_request_with_token_refresh(
-                client,
-                token_ref,
-                refresh,
-                lambda tok, p=piece, crn=cr: client.put(
-                    location,
-                    headers={
-                        "Authorization": f"Bearer {tok}",
-                        "Content-Length": str(len(p)),
-                        "Content-Range": crn,
-                    },
-                    content=p,
-                    timeout=300.0,
-                ),
+            r = await _put_resumable_chunk(
+                client, token_ref, refresh, location, piece, cr
             )
-            if r.status_code not in (200, 201, 308):
+            if r is None or r.status_code not in (200, 201, 308):
                 return False
+            del buf[:take]
             offset = range_end
             if on_upload_progress and file_size > 0:
-                up_pct = 50 + min(50, int((offset / file_size) * 50))
+                up_pct = int((offset / file_size) * 100)
                 await on_upload_progress(min(100, up_pct))
             if offset >= file_size:
                 if on_upload_progress:
@@ -473,25 +473,14 @@ async def gdrive_resumable_upload_stream(
         piece = bytes(buf)
         range_end = offset + len(piece)
         cr = f"bytes {offset}-{range_end - 1}/{file_size}"
-        r = await google_request_with_token_refresh(
-            client,
-            token_ref,
-            refresh,
-            lambda tok, p=piece, crn=cr: client.put(
-                location,
-                headers={
-                    "Authorization": f"Bearer {tok}",
-                    "Content-Length": str(len(p)),
-                    "Content-Range": crn,
-                },
-                content=p,
-                timeout=300.0,
-            ),
+        r = await _put_resumable_chunk(
+            client, token_ref, refresh, location, piece, cr
         )
-        ok = r.status_code in (200, 201)
-        if ok and on_upload_progress:
+        if r is None or r.status_code not in (200, 201):
+            return False
+        if on_upload_progress:
             await on_upload_progress(100)
-        return ok
+        return True
     if on_upload_progress and file_size > 0:
         await on_upload_progress(100)
     return True
@@ -675,18 +664,33 @@ async def run_folder_migration(
                     path_lower[len(root_path) :].lstrip("/") or file_name
                 )
     
-                async def emit_fp(p: int) -> None:
+                # Dropbox→GDrive は DL/UL を別スケールで保持し、合成 progress=(dl+ul)/2（上書きで 50% 固定に見えるのを防ぐ）
+                dl_pct = [0]
+                ul_pct = [0]
+
+                async def emit_file_progress() -> None:
+                    comb = int((dl_pct[0] + ul_pct[0]) / 2)
+                    comb = min(100, max(0, comb))
                     await event_q.put(
                         {
                             "type": "log",
                             "id": file_log_id,
                             "message": f"ファイル移行中: {rel}...",
-                            "progress": min(100, max(0, p)),
+                            "progress": comb,
+                            "progress_download": dl_pct[0],
+                            "progress_upload": ul_pct[0],
                             "level": "info",
                         }
                     )
-                    # イベントループに譲り NDJSON がクライアントへflushされやすくする（進捗バーの飛び防止）
                     await asyncio.sleep(0)
+
+                async def set_dl(p: int) -> None:
+                    dl_pct[0] = min(100, max(0, p))
+                    await emit_file_progress()
+
+                async def set_ul(p: int) -> None:
+                    ul_pct[0] = min(100, max(0, p))
+                    await emit_file_progress()
     
                 async with sem:
                     try:
@@ -712,6 +716,8 @@ async def run_folder_migration(
                                 "id": file_log_id,
                                 "message": f"ファイル移行中: {rel}...",
                                 "progress": 0,
+                                "progress_download": 0,
+                                "progress_upload": 0,
                                 "level": "info",
                             }
                         )
@@ -787,7 +793,7 @@ async def run_folder_migration(
                                 return
     
                         if is_paper:
-                            await emit_fp(5)
+                            await set_dl(5)
                             r = await dropbox_request_with_token_refresh(
                                 client,
                                 dropbox_token_ref,
@@ -824,9 +830,9 @@ async def run_folder_migration(
                                     }
                                 )
                                 return
-                            await emit_fp(20)
+                            await set_dl(25)
                             md = clean_markdown(r.text)
-                            await emit_fp(32)
+                            await set_dl(45)
                             try:
                                 docx_b = await markdown_to_docx_bytes(
                                     client,
@@ -851,23 +857,20 @@ async def run_folder_migration(
                                     }
                                 )
                                 return
-                            await emit_fp(45)
+                            await set_dl(80)
                             meta = gdrive_upload_metadata(
                                 base_name,
                                 "application/vnd.google-apps.document",
                                 g_parent_id,
                             )
-                            await emit_fp(50)
-                            _last_pct = [50]
+                            await set_dl(100)
 
                             async def on_multipart_sent(sent: int, total: int) -> None:
                                 if total <= 0:
                                     return
-                                pct = 50 + int((sent / total) * 49)
-                                pct = min(99, pct)
-                                if pct > _last_pct[0] or sent >= total:
-                                    _last_pct[0] = pct
-                                    await emit_fp(pct)
+                                u = int((sent / total) * 100)
+                                u = min(100, u)
+                                await set_ul(u)
 
                             uploaded_id = await gdrive_multipart_upload(
                                 client,
@@ -895,6 +898,8 @@ async def run_folder_migration(
                                         "id": file_log_id,
                                         "message": f"Paper変換完了: {rel}",
                                         "progress": 100,
+                                        "progress_download": 100,
+                                        "progress_upload": 100,
                                         "level": "success",
                                     }
                                 )
@@ -966,14 +971,14 @@ async def run_folder_migration(
                                             async for ch in resp.aiter_bytes():
                                                 loaded += len(ch)
                                                 if fsize > 0:
-                                                    await emit_fp(
-                                                        int(loaded / fsize * 50)
+                                                    await set_dl(
+                                                        int(loaded / fsize * 100)
                                                     )
                                                 yield ch
                                             return
     
                                 async def upload_cb(pct: int) -> None:
-                                    await emit_fp(min(99, pct))
+                                    await set_ul(min(100, pct))
     
                                 ok = await gdrive_resumable_upload_stream(
                                     client,
@@ -986,7 +991,7 @@ async def run_folder_migration(
                                     on_upload_progress=upload_cb,
                                 )
                             else:
-                                await emit_fp(5)
+                                await set_dl(5)
                                 dr = await dropbox_request_with_token_refresh(
                                     client,
                                     dropbox_token_ref,
@@ -1012,21 +1017,17 @@ async def run_folder_migration(
                                 ct = dr.headers.get("Content-Type", "")
                                 if ct:
                                     mime = ct.split(";")[0].strip()
-                                await emit_fp(45)
+                                await set_dl(100)
                                 meta = gdrive_upload_metadata(
                                     file_name, mime, g_parent_id
                                 )
-                                await emit_fp(50)
-                                _last_pct = [50]
-    
+
                                 async def on_multipart_sent(s: int, total: int) -> None:
                                     if total <= 0:
                                         return
-                                    pct = 50 + int((s / total) * 49)
-                                    pct = min(99, pct)
-                                    if pct > _last_pct[0] or s >= total:
-                                        _last_pct[0] = pct
-                                        await emit_fp(pct)
+                                    u = int((s / total) * 100)
+                                    u = min(100, u)
+                                    await set_ul(u)
     
                                 uploaded_id = await gdrive_multipart_upload(
                                     client,
@@ -1044,6 +1045,8 @@ async def run_folder_migration(
                                         "id": file_log_id,
                                         "message": f"ファイル転送完了: {rel}",
                                         "progress": 100,
+                                        "progress_download": 100,
+                                        "progress_upload": 100,
                                         "level": "success",
                                     }
                                 )
@@ -1117,13 +1120,25 @@ async def run_folder_migration(
                     )
                 await event_q.put(None)
 
+            # ストリーム切断などでジェネレータが閉じると async with が先に抜けて
+            # httpx クライアントだけ閉じ、run_all_files がまだ PUT 中だと
+            # "Cannot send a request, as the client has been closed" になる。
+            # runner を finally でキャンセル・待機してからクライアントを閉じる。
             runner = asyncio.create_task(run_all_files())
-            while True:
-                ev = await event_q.get()
-                if ev is None:
-                    break
-                yield ev
-            await runner
+            try:
+                while True:
+                    ev = await event_q.get()
+                    if ev is None:
+                        break
+                    yield ev
+                await runner
+            finally:
+                if not runner.done():
+                    runner.cancel()
+                    try:
+                        await runner
+                    except asyncio.CancelledError:
+                        pass
 
         except MigrationAuthError as e:
             yield {
@@ -1135,6 +1150,11 @@ async def run_folder_migration(
             return
 
         if not migration_aborted:
+            await asyncio.to_thread(
+                show_desktop_notification,
+                "Dropbox → Google Drive",
+                f'「{root_folder_name}」の移行が完了しました',
+            )
             yield {
                 "type": "log",
                 "message": f'✅ 移行完了: "{root_folder_name}"',

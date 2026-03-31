@@ -194,7 +194,16 @@ const App = () => {
   const [googleClient, setGoogleClient] = useState(null);
   // Hooks Initialization
   const dropbox = useDropbox(setStatus);
-  const gdrive = useGoogleDrive(setStatus);
+  const refreshGoogleTokenRef = React.useRef(null);
+  const gdrive = useGoogleDrive(setStatus, async () => {
+    const fn = refreshGoogleTokenRef.current;
+    if (typeof fn !== 'function') return null;
+    try {
+      return await fn();
+    } catch {
+      return null;
+    }
+  });
 
   const googleTokenRefreshTimerRef = React.useRef(null);
   const dropboxTokenRefreshTimerRef = React.useRef(null);
@@ -252,6 +261,9 @@ const App = () => {
           const data = await res.json();
           if (data.access_token) {
             console.log('[Auth] Google token リフレッシュ成功, expires_in=', data.expires_in);
+            if (data.refresh_token) {
+              localStorage.setItem('google_refresh_token', data.refresh_token);
+            }
             gDriveTokenRef.current = data.access_token;
             gdrive.setGDriveToken(data.access_token);
             if (googleTokenRefreshTimerRef.current) clearInterval(googleTokenRefreshTimerRef.current);
@@ -307,6 +319,26 @@ const App = () => {
 
     return promise;
   }, [googleClient, gdrive]);
+
+  React.useEffect(() => {
+    refreshGoogleTokenRef.current = refreshGoogleToken;
+  }, [refreshGoogleToken]);
+
+  // WebView / ブラウザのバックグラウンドで setInterval が遅れるとアクセス切れになるため、フォアグラウンド復帰で先回りリフレッシュ
+  React.useEffect(() => {
+    let last = 0;
+    const onVis = () => {
+      if (document.visibilityState !== 'visible') return;
+      const now = Date.now();
+      if (now - last < 120000) return;
+      last = now;
+      if (!usesBackendOAuth()) return;
+      if (!localStorage.getItem('google_refresh_token')) return;
+      refreshGoogleTokenRef.current?.().catch(() => {});
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, []);
 
   // Desktop: Keychain（トークン）+ 設定ファイル（フォルダ位置）を起動時に復元
   useEffect(() => {

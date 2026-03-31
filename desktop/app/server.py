@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import dist_dir
-from .logging_config import configure_dev_logging
+from .logging_config import configure_app_logging
 from .dropbox_oauth_routes import router as dropbox_oauth_router
 from .google_oauth_routes import router as google_oauth_router
 from .engine_routes import router as engine_router
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 def create_app(static_root: Path | None = None) -> FastAPI:
-    configure_dev_logging()
+    configure_app_logging()
     root = static_root or dist_dir()
     app = FastAPI(title="Paper Migrator Desktop")
 

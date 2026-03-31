@@ -1,6 +1,6 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 
-export const useGoogleDrive = (setStatus) => {
+export const useGoogleDrive = (setStatus, refreshAccessToken = null) => {
   const [gDriveToken, setGDriveToken] = useState(localStorage.getItem('gdrive_token'));
   const [gDriveBrowserLoading, setGDriveBrowserLoading] = useState(false);
   const [gDriveBrowserFiles, setGDriveBrowserFiles] = useState([]);
@@ -24,6 +24,11 @@ export const useGoogleDrive = (setStatus) => {
   const [folderSearchTerm, setFolderSearchTerm] = useState('');
   const [isGDriveLoading, setIsGDriveLoading] = useState(false);
   const [isGDriveProcessing, setIsGDriveProcessing] = useState(false);
+
+  const gDriveTokenRef = useRef(gDriveToken);
+  useEffect(() => {
+    gDriveTokenRef.current = gDriveToken;
+  }, [gDriveToken]);
 
   useEffect(() => {
     if (gDriveToken) {
@@ -64,6 +69,56 @@ export const useGoogleDrive = (setStatus) => {
     }
   }, [setStatus]);
 
+  /** 401 のとき refreshAccessToken で再発行してから再試行（定期リフレッシュが遅れた場合の救済） */
+  const fetchWithAuth = useCallback(
+    async (url, options = {}, tokenOverride = null) => {
+      let token = tokenOverride ?? gDriveTokenRef.current ?? gDriveToken;
+      if (!token) return null;
+      const doReq = (t) =>
+        fetch(url, {
+          ...options,
+          headers: { ...options.headers, Authorization: `Bearer ${t}` },
+        });
+      let res = await doReq(token);
+      if (res.status === 401 && refreshAccessToken) {
+        try {
+          const newTok = await refreshAccessToken();
+          if (newTok) {
+            gDriveTokenRef.current = newTok;
+            res = await doReq(newTok);
+          }
+        } catch (e) {
+          console.warn('[useGoogleDrive] Token refresh after 401 failed', e);
+        }
+      }
+      if (res.status === 401) {
+        handleGoogleLogout(false);
+      }
+      return res;
+    },
+    [gDriveToken, refreshAccessToken, handleGoogleLogout]
+  );
+
+  const fetchGDriveDrives = useCallback(
+    async (token) => {
+      try {
+        const response = await fetchWithAuth(
+          'https://www.googleapis.com/drive/v3/drives?pageSize=100&fields=drives(id,name)',
+          { headers: {} },
+          token
+        );
+        if (!response || response.status === 401) return [];
+        if (!response.ok) return [];
+        const data = await response.json();
+        return data.drives || [];
+      } catch (err) {
+        console.error('Failed to fetch shared drives:', err);
+        return [];
+      }
+    },
+    [fetchWithAuth]
+  );
+
   const fetchGDriveContents = useCallback(async (folderId = 'home') => {
     if (!gDriveToken) return;
     setGDriveBrowserLoading(true);
@@ -82,14 +137,12 @@ export const useGoogleDrive = (setStatus) => {
         setGDriveBrowserFiles([...folders, ...sharedDrives]);
       } else {
         const q = `'${folderId}' in parents and trashed=false`;
-        const response = await fetch(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name,mimeType,modifiedTime,size,webViewLink)&supportsAllDrives=true&includeItemsFromAllDrives=true&orderBy=folder,name&pageSize=200`, {
-          headers: { 'Authorization': `Bearer ${gDriveToken}` }
-        });
-
-        if (response.status === 401) {
-          handleGoogleLogout(false);
-          return;
-        }
+        const response = await fetchWithAuth(
+          `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name,mimeType,modifiedTime,size,webViewLink)&supportsAllDrives=true&includeItemsFromAllDrives=true&orderBy=folder,name&pageSize=200`,
+          { headers: {} },
+          gDriveToken
+        );
+        if (!response || response.status === 401) return;
         const data = await response.json();
         setGDriveBrowserFiles(data.files || []);
       }
@@ -99,45 +152,53 @@ export const useGoogleDrive = (setStatus) => {
     } finally {
       setGDriveBrowserLoading(false);
     }
-  }, [gDriveToken, handleGoogleLogout, setStatus]);
+  }, [gDriveToken, fetchWithAuth, fetchGDriveDrives, setStatus]);
 
-  const fetchGDriveDrives = async (token) => {
+  const fetchGDriveFolders = useCallback(async (token, folderId = 'root') => {
+    setIsGDriveLoading(true);
     try {
-      const response = await fetch('https://www.googleapis.com/drive/v3/drives?pageSize=100&fields=drives(id,name)', {
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-      if (response.status === 401) {
-        handleGoogleLogout();
-        return [];
+      const tok = token ?? gDriveTokenRef.current;
+      if (folderId === 'root' && pickerDriveType === 'shared') {
+        const drives = await fetchGDriveDrives(tok);
+        setGDriveDrives(drives);
+        setGDriveFolders([]);
+      } else {
+        const q = folderId === 'root' ? "'root' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false" : `'${folderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+        const response = await fetchWithAuth(
+          `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name)&supportsAllDrives=true&includeItemsFromAllDrives=true&pageSize=100`,
+          { headers: {} },
+          tok
+        );
+        if (!response || response.status === 401) return;
+        const data = await response.json();
+        setGDriveFolders(data.files || []);
       }
-      if (!response.ok) return [];
-      const data = await response.json();
-      return data.drives || [];
     } catch (err) {
-      console.error('Failed to fetch shared drives:', err);
-      return [];
+      console.error('Failed to fetch folders:', err);
+    } finally {
+      setIsGDriveLoading(false);
     }
-  };
+  }, [pickerDriveType, fetchGDriveDrives, fetchWithAuth]);
 
   const createGDriveFolder = useCallback(async (token, parentId, name) => {
     if (!name.trim()) return;
     setIsGDriveLoading(true);
     try {
-      const response = await fetch('https://www.googleapis.com/drive/v3/files?supportsAllDrives=true', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json'
+      const response = await fetchWithAuth(
+        'https://www.googleapis.com/drive/v3/files?supportsAllDrives=true',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: name,
+            mimeType: 'application/vnd.google-apps.folder',
+            parents: parentId === 'root' ? [] : [parentId],
+          }),
         },
-        body: JSON.stringify({
-          name: name,
-          mimeType: 'application/vnd.google-apps.folder',
-          parents: parentId === 'root' ? [] : [parentId]
-        })
-      });
+        token
+      );
 
-      if (response.status === 401) {
-        handleGoogleLogout();
+      if (!response || response.status === 401) {
         throw new Error('セッションが切れました。再度ログインしてください。');
       }
       if (!response.ok) throw new Error('フォルダ作成に失敗しました');
@@ -149,40 +210,14 @@ export const useGoogleDrive = (setStatus) => {
       // 再読み込み
       fetchGDriveContents(parentId);
       // ピッカー内のフォルダ一覧も更新（必要であれば）
-      fetchGDriveFolders(token, parentId);
+      fetchGDriveFolders(gDriveTokenRef.current, parentId);
 
     } catch (err) {
       setStatus({ type: 'error', message: err.message });
     } finally {
       setIsGDriveLoading(false);
     }
-  }, [fetchGDriveContents, setStatus]);
-
-  const fetchGDriveFolders = useCallback(async (token, folderId = 'root') => {
-    setIsGDriveLoading(true);
-    try {
-      if (folderId === 'root' && pickerDriveType === 'shared') {
-        const drives = await fetchGDriveDrives(token);
-        setGDriveDrives(drives);
-        setGDriveFolders([]);
-      } else {
-        const q = folderId === 'root' ? "'root' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false" : `'${folderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
-        const response = await fetch(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name)&supportsAllDrives=true&includeItemsFromAllDrives=true&pageSize=100`, {
-          headers: { 'Authorization': `Bearer ${token}` }
-        });
-        if (response.status === 401) {
-          handleGoogleLogout();
-          return;
-        }
-        const data = await response.json();
-        setGDriveFolders(data.files || []);
-      }
-    } catch (err) {
-      console.error('Failed to fetch folders:', err);
-    } finally {
-      setIsGDriveLoading(false);
-    }
-  }, [pickerDriveType]);
+  }, [fetchGDriveContents, fetchGDriveFolders, fetchWithAuth, setStatus]);
 
   const navigateGDriveBrowserTo = useCallback((index) => {
     const newPath = gDriveBrowserPath.slice(0, index + 1);
@@ -197,19 +232,19 @@ export const useGoogleDrive = (setStatus) => {
     console.log('[useGDrive] renameGDriveFolder map:', { folderId, newName, currentParentId });
     setIsGDriveLoading(true);
     try {
-      const response = await fetch(`https://www.googleapis.com/drive/v3/files/${folderId}?supportsAllDrives=true`, {
-        method: 'PATCH',
-        headers: {
-          'Authorization': `Bearer ${gDriveToken}`,
-          'Content-Type': 'application/json'
+      const response = await fetchWithAuth(
+        `https://www.googleapis.com/drive/v3/files/${folderId}?supportsAllDrives=true`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: newName }),
         },
-        body: JSON.stringify({ name: newName })
-      });
+        gDriveToken
+      );
 
-      console.log('[useGDrive] API response status:', response.status);
+      console.log('[useGDrive] API response status:', response?.status);
 
-      if (response.status === 401) {
-        handleGoogleLogout();
+      if (!response || response.status === 401) {
         throw new Error('セッションが切れました。再度ログインしてください。');
       }
 
@@ -229,7 +264,7 @@ export const useGoogleDrive = (setStatus) => {
     } finally {
       setIsGDriveLoading(false);
     }
-  }, [gDriveToken, handleGoogleLogout, fetchGDriveContents]);
+  }, [gDriveToken, fetchWithAuth, fetchGDriveContents]);
 
   const navigateGDriveBrowser = useCallback((folderId, folderName) => {
     const newPath = [...gDriveBrowserPath, { id: folderId, name: folderName }];
@@ -255,8 +290,8 @@ export const useGoogleDrive = (setStatus) => {
           const q = `'${fid}' in parents and trashed=false`;
           let url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name,mimeType),nextPageToken&supportsAllDrives=true&includeItemsFromAllDrives=true&pageSize=200`;
           if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
-          const res = await fetch(url, { headers: { 'Authorization': `Bearer ${gDriveToken}` } });
-          if (!res.ok) throw new Error('フォルダ内容の取得に失敗しました');
+          const res = await fetchWithAuth(url, { headers: {} }, gDriveTokenRef.current);
+          if (!res || !res.ok) throw new Error('フォルダ内容の取得に失敗しました');
           const data = await res.json();
           all.push(...(data.files || []));
           pageToken = data.nextPageToken || null;
@@ -264,29 +299,37 @@ export const useGoogleDrive = (setStatus) => {
         return all;
       };
       const createFolder = async (pId, name) => {
-        const res = await fetch('https://www.googleapis.com/drive/v3/files?supportsAllDrives=true', {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${gDriveToken}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name,
-            mimeType: 'application/vnd.google-apps.folder',
-            parents: pId === 'root' ? [] : [pId]
-          })
-        });
-        if (!res.ok) throw new Error(`フォルダ作成に失敗: ${name}`);
+        const res = await fetchWithAuth(
+          'https://www.googleapis.com/drive/v3/files?supportsAllDrives=true',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name,
+              mimeType: 'application/vnd.google-apps.folder',
+              parents: pId === 'root' ? [] : [pId],
+            }),
+          },
+          gDriveTokenRef.current
+        );
+        if (!res || !res.ok) throw new Error(`フォルダ作成に失敗: ${name}`);
         const data = await res.json();
         return data.id;
       };
       const copyFile = async (fileId, newParentId, fileName) => {
-        const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}/copy?supportsAllDrives=true`, {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${gDriveToken}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            parents: newParentId === 'root' ? [] : [newParentId],
-            name: fileName
-          })
-        });
-        if (!res.ok) throw new Error(`ファイルコピーに失敗: ${fileName}`);
+        const res = await fetchWithAuth(
+          `https://www.googleapis.com/drive/v3/files/${fileId}/copy?supportsAllDrives=true`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              parents: newParentId === 'root' ? [] : [newParentId],
+              name: fileName,
+            }),
+          },
+          gDriveTokenRef.current
+        );
+        if (!res || !res.ok) throw new Error(`ファイルコピーに失敗: ${fileName}`);
       };
       const duplicateRecursive = async (srcId, destParentId, name) => {
         const newFolderId = await createFolder(destParentId, name);
@@ -309,7 +352,7 @@ export const useGoogleDrive = (setStatus) => {
     } finally {
       setIsGDriveProcessing(false);
     }
-  }, [gDriveToken, handleGoogleLogout, fetchGDriveContents, setStatus]);
+  }, [gDriveToken, fetchWithAuth, fetchGDriveContents, setStatus]);
 
   const navigateToGDriveFolder = useCallback((folderId, folderName) => {
     setPickerFolderId(folderId);

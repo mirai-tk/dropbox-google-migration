@@ -41,7 +41,7 @@ source .venv/bin/activate          # fish なら: source .venv/bin/activate.fish
 python run_desktop.py
 ```
 
-マイグレーション失敗の原因調査用に **ファイルログ** を有効にする場合: `python run_desktop.py --dev`、または `.env` に `PAPER_MIGRATOR_DEV=1`。出力は既定で `desktop/logs/migration-debug.log`（パスを変えるときは `PAPER_MIGRATOR_LOG_FILE`）。Paper の export 失敗時のレスポンス本文や GDrive multipart エラー本文が記録されます。
+アプリ全体のログは既定で **`desktop/logs/app.log`**（ローテーション付き）に出力されます。より詳細な DEBUG（マイグレーション／Paper 調査用）にする場合は `python run_desktop.py --dev`、または `.env` に `PAPER_MIGRATOR_DEV=1`。パスを変えるときは環境変数 `PAPER_MIGRATOR_LOG_FILE`。
 
 ブラウザではなく **pywebview** のウィンドウが開き、`127.0.0.1:8765` で FastAPI が UI と `/api/*` を提供します。
 

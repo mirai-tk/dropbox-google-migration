@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useMemo, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { Terminal, Loader2, CheckCircle2, AlertCircle, Info, X, SkipForward } from 'lucide-react';
 
 /** スキップ系は進捗・完了タブに混ぜない（スキップタブ専用） */
@@ -40,8 +40,21 @@ const isOverallMigrationProgressLine = (log) => {
   );
 };
 
+/** DL/UL 二本は「どちらかがまだ途上」のときだけ。両方100%や完了行は同じ数字が二重に見えるので単一バーにする */
+const shouldShowDualTransferBars = (log) => {
+  if (!log.id?.startsWith('file-')) return false;
+  if (typeof log.progress_download !== 'number' || typeof log.progress_upload !== 'number') return false;
+  if (log.type === 'success' || log.type === 'error') return false;
+  if (isSkipped(log)) return false;
+  const msg = log.message || '';
+  if (hasCompletionMessage(msg)) return false;
+  const dl = log.progress_download;
+  const ul = log.progress_upload;
+  if (dl >= 100 && ul >= 100) return false;
+  return true;
+};
+
 export const LogViewer = ({ logs = [], onClear, onClose }) => {
-  const scrollRef = useRef(null);
   const [activeTab, setActiveTab] = useState('progress');
 
   const { progressLogs, completedLogs, errorLogs, skippedLogs } = useMemo(() => ({
@@ -65,12 +78,6 @@ export const LogViewer = ({ logs = [], onClear, onClose }) => {
     return skippedLogs;
   }, [activeTab, progressLogs, completedLogs, errorLogs, skippedLogs]);
 
-  useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [displayLogs]);
-
   if (logs.length === 0) return null;
 
   const progressCount = progressLogs.length;
@@ -91,7 +98,7 @@ export const LogViewer = ({ logs = [], onClear, onClose }) => {
           <div className="flex items-center gap-2">
             <div className="flex-1 bg-slate-700/60 rounded-full h-1.5 overflow-hidden">
               <div
-                className={`h-full rounded-full transition-all duration-700 ease-out ${overallProgressLog.progress >= 100 ? 'bg-emerald-500' : 'bg-sky-400'}`}
+                className={`h-full rounded-full ${overallProgressLog.progress >= 100 ? 'bg-emerald-500' : 'bg-sky-400'}`}
                 style={{ width: `${overallProgressLog.progress}%` }}
               />
             </div>
@@ -139,10 +146,7 @@ export const LogViewer = ({ logs = [], onClear, onClose }) => {
           </button>
         </div>
       </div>
-      <div
-        ref={scrollRef}
-        className="flex-1 overflow-auto p-3 font-mono text-[11px] space-y-1 custom-scrollbar"
-      >
+      <div className="flex-1 overflow-auto p-3 font-mono text-[11px] space-y-1 custom-scrollbar">
         {displayLogs.length === 0 ? (
           <div className="flex items-center justify-center h-full text-slate-500 text-[10px]">
             {activeTab === 'progress' && '実行中のタスクはありません'}
@@ -169,16 +173,47 @@ export const LogViewer = ({ logs = [], onClear, onClose }) => {
                     {log.message || '処理中...'}
                   </span>
                   {log.progress !== null && log.progress !== undefined && (
-                    <div className="mt-1 flex items-center gap-2">
-                      <div className="flex-1 bg-slate-700/60 rounded-full h-[2px] overflow-hidden">
-                        <div
-                          className={`h-full rounded-full transition-all duration-700 ease-out ${log.progress >= 100 ? 'bg-emerald-500' : 'bg-sky-400 shadow-[0_0_6px_rgba(56,189,248,0.6)]'}`}
-                          style={{ width: `${log.progress}%` }}
-                        />
-                      </div>
-                      <span className={`text-[9px] font-bold tabular-nums min-w-[28px] text-right ${log.progress >= 100 ? 'text-emerald-500' : 'text-sky-400'}`}>
-                        {Math.round(log.progress)}%
-                      </span>
+                    <div className="mt-1 flex flex-col gap-1">
+                      {shouldShowDualTransferBars(log) ? (
+                        <>
+                          <div className="flex items-center gap-2">
+                            <span className="text-[8px] font-bold text-slate-500 w-6 shrink-0">DL</span>
+                            <div className="flex-1 bg-slate-700/60 rounded-full h-[2px] overflow-hidden">
+                              <div
+                                className={`h-full rounded-full ${log.progress_download >= 100 ? 'bg-cyan-500/90' : 'bg-cyan-400/80'}`}
+                                style={{ width: `${log.progress_download}%` }}
+                              />
+                            </div>
+                            <span className="text-[8px] font-bold tabular-nums min-w-[26px] text-right text-cyan-400/90">
+                              {Math.round(log.progress_download)}%
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="text-[8px] font-bold text-slate-500 w-6 shrink-0">UL</span>
+                            <div className="flex-1 bg-slate-700/60 rounded-full h-[2px] overflow-hidden">
+                              <div
+                                className={`h-full rounded-full ${log.progress_upload >= 100 ? 'bg-violet-500/90' : 'bg-violet-400/80'}`}
+                                style={{ width: `${log.progress_upload}%` }}
+                              />
+                            </div>
+                            <span className="text-[8px] font-bold tabular-nums min-w-[26px] text-right text-violet-400/90">
+                              {Math.round(log.progress_upload)}%
+                            </span>
+                          </div>
+                        </>
+                      ) : (
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1 bg-slate-700/60 rounded-full h-[2px] overflow-hidden">
+                            <div
+                              className={`h-full rounded-full ${log.progress >= 100 ? 'bg-emerald-500' : 'bg-sky-400 shadow-[0_0_6px_rgba(56,189,248,0.6)]'}`}
+                              style={{ width: `${log.progress}%` }}
+                            />
+                          </div>
+                          <span className={`text-[9px] font-bold tabular-nums min-w-[28px] text-right ${log.progress >= 100 ? 'text-emerald-500' : 'text-sky-400'}`}>
+                            {Math.round(log.progress)}%
+                          </span>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>

@@ -32,7 +32,7 @@ def main() -> None:
     parser.add_argument(
         "--dev",
         action="store_true",
-        help="開発モード: マイグレーション詳細を desktop/logs/migration-debug.log に出力（PAPER_MIGRATOR_DEV と同じ）",
+        help="開発モード: アプリログを DEBUG 詳細に（PAPER_MIGRATOR_DEV と同じ。既定の出力先は desktop/logs/app.log）",
     )
     args = parser.parse_args()
     if args.dev:

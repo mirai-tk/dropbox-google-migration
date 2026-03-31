@@ -20,6 +20,28 @@ const asyncPool = async (poolLimit, array, iteratorFn) => {
   return Promise.all(ret);
 };
 
+/** ブラウザ移行完了時の OS 通知（ネイティブエンジン時は Python が通知するためスキップ） */
+function notifyMigrationCompleteDesktop(rootFolderName) {
+  if (import.meta.env.VITE_USE_NATIVE_ENGINE === 'true') return;
+  if (typeof window === 'undefined' || typeof Notification === 'undefined') return;
+  const body = `「${rootFolderName}」の移行が完了しました`;
+  const title = '移行完了';
+  const run = () => {
+    try {
+      new Notification(title, { body });
+    } catch {
+      /* ignore */
+    }
+  };
+  if (Notification.permission === 'granted') {
+    run();
+  } else if (Notification.permission === 'default') {
+    void Notification.requestPermission().then((p) => {
+      if (p === 'granted') run();
+    });
+  }
+}
+
 export const useConverter = (
   selectedFolderId,
   gDriveBrowserPath = [],
@@ -829,6 +851,12 @@ export const useConverter = (
                 message: ev.message,
                 type: level,
                 progress: ev.progress,
+                ...(typeof ev.progress_download === 'number'
+                  ? { progress_download: ev.progress_download }
+                  : {}),
+                ...(typeof ev.progress_upload === 'number'
+                  ? { progress_upload: ev.progress_upload }
+                  : {}),
               });
               const mid = ev.id && String(ev.id).startsWith('migrate-');
               const msg = ev.message || '';
@@ -1138,6 +1166,7 @@ export const useConverter = (
 
       log(`移行進捗: 移行完了 (${files.length}/${files.length})`, 'success', migrationId, 100);
       log(`✅ 全工程が完了しました: "${rootFolderName}" の移行完了`, 'success');
+      notifyMigrationCompleteDesktop(rootFolderName);
       setStatus({ type: 'success', message: `フォルダ "${rootFolderName}" の移行が正常に完了しました` });
       if (fetchGDriveContents) fetchGDriveContents(selectedFolderId);
     } catch (err) {
