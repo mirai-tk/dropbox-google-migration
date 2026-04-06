@@ -137,12 +137,25 @@ export const useGoogleDrive = (setStatus, refreshAccessToken = null) => {
         setGDriveBrowserFiles([...folders, ...sharedDrives]);
       } else {
         const q = `'${folderId}' in parents and trashed=false`;
+        const fields =
+          'files(id,name,mimeType,modifiedTime,size,webViewLink,capabilities(canEdit,canDownload,canListChildren,canAddChildren))';
         const response = await fetchWithAuth(
-          `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name,mimeType,modifiedTime,size,webViewLink)&supportsAllDrives=true&includeItemsFromAllDrives=true&orderBy=folder,name&pageSize=200`,
+          `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=${encodeURIComponent(fields)}&supportsAllDrives=true&includeItemsFromAllDrives=true&orderBy=folder,name&pageSize=200`,
           { headers: {} },
           gDriveToken
         );
         if (!response || response.status === 401) return;
+        if (!response.ok) {
+          let msg = 'Google Drive の一覧を取得できませんでした（権限やネットワークを確認してください）';
+          try {
+            const j = await response.json();
+            if (j.error?.message) msg = j.error.message;
+          } catch {
+            /* ignore */
+          }
+          setStatus({ type: 'warning', message: msg });
+          return;
+        }
         const data = await response.json();
         setGDriveBrowserFiles(data.files || []);
       }

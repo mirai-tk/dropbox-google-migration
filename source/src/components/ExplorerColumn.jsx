@@ -1,4 +1,4 @@
-import React, { useRef, useEffect } from 'react';
+import React, { useRef, useEffect, useLayoutEffect } from 'react';
 import { ChevronRight, Loader2 } from 'lucide-react';
 
 export const ExplorerColumn = ({
@@ -16,9 +16,18 @@ export const ExplorerColumn = ({
   emptyIcon: EmptyIcon,
   items = [],
   renderItem,
+  /** フォルダ移動時は変わるキー（同じキー内での一覧更新＝リネーム時はスクロールを維持） */
+  scrollContextKey,
   children
 }) => {
   const breadcrumbRef = useRef(null);
+  const listScrollRef = useRef(null);
+  /** 一覧差し替え前に DOM がリセットされることがあるため、onScroll で常に保持する */
+  const lastListScrollTopRef = useRef(0);
+  const prevScrollContextKeyRef = useRef(scrollContextKey);
+  /** 一覧更新直後、ブラウザが一瞬 scrollTop=0 にして onScroll が先に走ると ref が 0 に汚れるのを防ぐ */
+  const suppressScrollCaptureRef = useRef(false);
+  const scrollRestoreGenRef = useRef(0);
 
   // オートスクロール: パンくずリストが追加されたら右端へ
   useEffect(() => {
@@ -29,6 +38,34 @@ export const ExplorerColumn = ({
       });
     }
   }, [breadcrumbs]);
+
+  useLayoutEffect(() => {
+    if (scrollContextKey === undefined) return;
+    const el = listScrollRef.current;
+    if (scrollContextKey !== prevScrollContextKeyRef.current) {
+      prevScrollContextKeyRef.current = scrollContextKey;
+      lastListScrollTopRef.current = 0;
+      if (el) el.scrollTop = 0;
+      return;
+    }
+    if (!el) return;
+    const target = lastListScrollTopRef.current;
+    const ctx = scrollContextKey;
+    scrollRestoreGenRef.current += 1;
+    const gen = scrollRestoreGenRef.current;
+    suppressScrollCaptureRef.current = true;
+    el.scrollTop = target;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (gen !== scrollRestoreGenRef.current) return;
+        const inner = listScrollRef.current;
+        if (inner && prevScrollContextKeyRef.current === ctx) {
+          inner.scrollTop = target;
+        }
+        suppressScrollCaptureRef.current = false;
+      });
+    });
+  }, [items, scrollContextKey]);
 
   return (
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden bg-white">
@@ -71,7 +108,14 @@ export const ExplorerColumn = ({
       {/* List Content Container (相対配置の親) */}
       <div className="flex-1 relative min-h-0">
         {/* Scrollable List Content */}
-        <div className="absolute inset-0 overflow-auto p-3 space-y-1 custom-scrollbar">
+        <div
+          ref={listScrollRef}
+          onScroll={(e) => {
+            if (suppressScrollCaptureRef.current) return;
+            lastListScrollTopRef.current = e.currentTarget.scrollTop;
+          }}
+          className="absolute inset-0 overflow-auto p-3 space-y-1 custom-scrollbar"
+        >
           {children}
 
           {isLoading && items.length === 0 ? (

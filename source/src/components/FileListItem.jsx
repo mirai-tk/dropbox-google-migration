@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Folder, FileType, FileText, Check, ChevronRight, ArrowRight, ExternalLink, Home, HardDrive, FolderPlus, Pencil, X, Loader2, CloudUpload, Copy } from 'lucide-react';
 import { formatFileSize } from '../utils/formatFileSize';
+import { shouldIgnoreEnterForSubmit } from '../utils/imeEnter';
 
 export const FileListItem = ({
   item,
@@ -19,15 +20,20 @@ export const FileListItem = ({
   showExternalLink = false,
   externalLink,
   onRename, // async function(newName) returns boolean
-  type = 'dropbox' // 'dropbox' or 'gdrive'
+  type = 'dropbox', // 'dropbox' or 'gdrive'
+  /** full: 通常 / restricted: 閲覧のみ等（制限あり） / none: 開けない・取得不可 */
+  accessLevel = 'full'
 }) => {
   const isGDrive = type === 'gdrive';
+  const blocked = accessLevel === 'none';
+  const restricted = accessLevel === 'restricted';
   const [isRenaming, setIsRenaming] = useState(false);
   const [editName, setEditName] = useState(item.name);
   const [isRenameSaving, setIsRenameSaving] = useState(false);
   const [isRecursiveMigrating, setIsRecursiveMigrating] = useState(false);
   const [isDuplicating, setIsDuplicating] = useState(false);
   const inputRef = useRef(null);
+  const itemStableId = item.path_lower ?? item.id;
 
   useEffect(() => {
     if (isRenaming && inputRef.current) {
@@ -37,11 +43,21 @@ export const FileListItem = ({
     }
   }, [isRenaming]);
 
+  // key がフォルダ単位で安定しても、親の一覧更新で item.name が変わるので同期する（リネーム編集中は上書きしない）
+  useEffect(() => {
+    if (!isRenaming) {
+      setEditName(item.name);
+    }
+  }, [item.name, itemStableId, isRenaming]);
+
   const handleRenameSubmit = async (e) => {
     if (e) {
       e.stopPropagation();
-      if (e.type === 'keydown' && e.key !== 'Enter') return;
-      if (e.type === 'keydown' && e.nativeEvent.isComposing) return;
+      if (e.type === 'keydown') {
+        if (e.key !== 'Enter') return;
+        if (shouldIgnoreEnterForSubmit(e)) return;
+        e.preventDefault();
+      }
     }
 
     const trimmedName = editName.trim();
@@ -83,6 +99,7 @@ export const FileListItem = ({
 
   const handleRecursiveMigrate = async (e) => {
     e.stopPropagation();
+    if (blocked) return;
     if (onRecursiveMigrateClick && !isRecursiveMigrating) {
       setIsRecursiveMigrating(true);
       try {
@@ -95,6 +112,7 @@ export const FileListItem = ({
 
   const handleDuplicate = async (e) => {
     e.stopPropagation();
+    if (blocked) return;
     if (onDuplicateClick && !isDuplicating) {
       setIsDuplicating(true);
       try {
@@ -124,20 +142,21 @@ export const FileListItem = ({
 
   // ルートフォルダなどは名前変更不可とする
   const canRename = isFolder && onRename && !item.isRoot && !item.isSharedDrive;
+  const renameAllowed = canRename && accessLevel === 'full';
 
   return (
     <div
-      className={`flex items-center justify-between p-2 rounded-lg transition-all group border h-[48px] ${isRenaming ? 'bg-slate-50 border-slate-200 shadow-sm' : isSelected ? 'bg-indigo-50/50 border-indigo-100' : `bg-white border-slate-100 ${hoverClass}`} ${!isRenaming && 'cursor-pointer'}`}
+      className={`flex items-center justify-between p-2 rounded-lg transition-all group border h-[48px] ${blocked ? 'opacity-45 bg-slate-50 border-slate-200' : ''} ${isRenaming ? 'bg-slate-50 border-slate-200 shadow-sm' : isSelected ? 'bg-indigo-50/50 border-indigo-100' : `bg-white border-slate-100 ${hoverClass}`} ${!isRenaming && !blocked && 'cursor-pointer'} ${blocked ? 'cursor-not-allowed' : ''}`}
       onClick={(e) => {
-        if (isRenaming) return;
+        if (isRenaming || blocked) return;
         isFolder && onItemClick ? onItemClick() : (onToggleSelect && onToggleSelect());
       }}
     >
       <div className="flex items-center gap-2 flex-1 overflow-hidden">
         {showSelect && !isFolder && (
           <div
-            onClick={(e) => { e.stopPropagation(); onToggleSelect(); }}
-            className={`w-4 h-4 rounded border flex items-center justify-center transition-all cursor-pointer shrink-0 ${isSelected ? 'bg-indigo-600 border-indigo-600 text-white' : 'border-slate-200 hover:border-indigo-300'}`}
+            onClick={(e) => { e.stopPropagation(); if (!blocked) onToggleSelect(); }}
+            className={`w-4 h-4 rounded border flex items-center justify-center transition-all shrink-0 ${blocked ? 'opacity-40 cursor-not-allowed border-slate-200' : 'cursor-pointer'} ${isSelected ? 'bg-indigo-600 border-indigo-600 text-white' : 'border-slate-200 hover:border-indigo-300'}`}
           >
             {isSelected && <Check size={10} strokeWidth={3} />}
           </div>
@@ -185,9 +204,17 @@ export const FileListItem = ({
                 </button>
               </div>
             ) : (
-              <div className="flex flex-col min-w-0">
-                <p className="text-[11px] font-bold text-slate-700 truncate leading-tight">{item.name}</p>
-                <p className="text-[8px] text-slate-400 uppercase tracking-tighter leading-tight mt-0.5">
+              <div className="flex flex-col min-w-0 gap-0.5">
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <p className={`text-[11px] font-bold truncate leading-tight ${blocked ? 'text-slate-300' : 'text-slate-700'}`}>{item.name}</p>
+                  {restricted && (
+                    <span className="text-[8px] font-bold text-amber-700 bg-amber-100 px-1 py-0 rounded shrink-0">制限あり</span>
+                  )}
+                  {blocked && (
+                    <span className="text-[8px] font-bold text-slate-500 bg-slate-200 px-1 py-0 rounded shrink-0">アクセス不可</span>
+                  )}
+                </div>
+                <p className="text-[8px] text-slate-400 uppercase tracking-tighter leading-tight">
                   {isGDrive ? (
                     <>
                       {item.isRoot ? 'マイドライブ' : item.isSharedDrive ? '共有ドライブ' : item.mimeType?.split('.').pop() || 'FOLDER'}
@@ -207,7 +234,7 @@ export const FileListItem = ({
       </div>
 
       <div className="flex items-center gap-1">
-        {canRename && !isRenaming && (
+        {renameAllowed && !isRenaming && (
           <button
             onClick={(e) => { e.stopPropagation(); setEditName(item.name); setIsRenaming(true); }}
             className={`opacity-0 group-hover:opacity-100 p-1.5 rounded-md transition-all font-bold ${isGDrive ? 'hover:bg-emerald-100 text-emerald-600' : 'hover:bg-indigo-100 text-indigo-500'}`}
@@ -216,7 +243,7 @@ export const FileListItem = ({
             <Pencil size={12} strokeWidth={2.5} />
           </button>
         )}
-        {isFolder && showDuplicateButton && onDuplicateClick && !isRenaming && (
+        {isFolder && showDuplicateButton && onDuplicateClick && !isRenaming && !blocked && (
           <button
             onClick={handleDuplicate}
             disabled={isDuplicating}
@@ -226,7 +253,7 @@ export const FileListItem = ({
             {isDuplicating ? <Loader2 size={14} className="animate-spin" /> : <Copy size={14} strokeWidth={2.5} />}
           </button>
         )}
-        {isFolder && showFolderAction && !isRenaming && (
+        {isFolder && showFolderAction && !isRenaming && !blocked && (
           <button
             onClick={(e) => { e.stopPropagation(); onFolderActionClick(); }}
             className="opacity-0 group-hover:opacity-100 p-1.5 hover:bg-emerald-100 rounded-md text-emerald-600 transition-all font-bold"
@@ -235,7 +262,7 @@ export const FileListItem = ({
             <FolderPlus size={14} />
           </button>
         )}
-        {isFolder && onRecursiveMigrateClick && !isRenaming && (
+        {isFolder && onRecursiveMigrateClick && !isRenaming && !blocked && (
           <button
             onClick={handleRecursiveMigrate}
             disabled={isRecursiveMigrating}
@@ -245,8 +272,8 @@ export const FileListItem = ({
             {isRecursiveMigrating ? <Loader2 size={14} className="animate-spin" /> : <CloudUpload size={14} strokeWidth={2.5} />}
           </button>
         )}
-        {isFolder && !isRenaming && <ChevronRight size={14} className="text-slate-300 group-hover:text-slate-500 transition-colors" />}
-        {!isFolder && showArrow && (
+        {isFolder && !isRenaming && !blocked && <ChevronRight size={14} className="text-slate-300 group-hover:text-slate-500 transition-colors" />}
+        {!isFolder && showArrow && !blocked && (
           <button
             onClick={(e) => { e.stopPropagation(); onArrowClick(); }}
             className="opacity-0 group-hover:opacity-100 p-1.5 hover:bg-indigo-100 rounded-md text-indigo-500 transition-all font-bold"
@@ -254,7 +281,7 @@ export const FileListItem = ({
             <ArrowRight size={14} />
           </button>
         )}
-        {!isFolder && showExternalLink && externalLink && (
+        {!isFolder && showExternalLink && externalLink && !blocked && (
            <a
              href={externalLink}
              target="_blank"

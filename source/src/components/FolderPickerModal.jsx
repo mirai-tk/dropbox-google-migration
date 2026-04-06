@@ -1,5 +1,6 @@
 import React from 'react';
 import { FolderOpen, X, ChevronRight, ArrowLeft, FileUp, Loader2, Folder, Check, Building2 } from 'lucide-react';
+import { shouldIgnoreEnterForSubmit } from '../utils/imeEnter';
 
 export const FolderPickerModal = ({
   isOpen,
@@ -139,9 +140,10 @@ export const FolderPickerModal = ({
                          value={newFolderName}
                          onChange={(e) => setNewFolderName(e.target.value)}
                          onKeyDown={(e) => {
-                           if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
-                             createGDriveFolder(gDriveToken, pickerFolderId, newFolderName);
-                           }
+                           if (e.key !== 'Enter') return;
+                           if (shouldIgnoreEnterForSubmit(e)) return;
+                           e.preventDefault();
+                           createGDriveFolder(gDriveToken, pickerFolderId, newFolderName);
                          }}
                          placeholder="フォルダ名を入力..."
                          autoFocus

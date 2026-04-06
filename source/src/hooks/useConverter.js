@@ -2,9 +2,23 @@ import { useState, useCallback } from 'react';
 import { cleanMarkdown, generateDocxBlob } from '../utils/markdownParser';
 import { convertTaskMarkersToNativeChecklists } from '../utils/googleDocsChecklist';
 
+// 軽量ファイルの同時処理数（80MB 超は直列・ネイティブエンジンと揃える）
 const MIGRATION_POOL_SIZE = 5;
-const RESUMABLE_UPLOAD_THRESHOLD = 400 * 1024 * 1024;
+/** これを超える通常ファイルは Dropbox ストリーム → GDrive resumable。かつこの閾値超は同時1件のみ。 */
+const STREAMING_MIGRATION_MIN_BYTES = 80 * 1024 * 1024;
 const RESUMABLE_CHUNK_SIZE = 256 * 1024;
+
+/** ファイルサイズが分かるときの DL/UL バイト表示用（％から近似） */
+const transferBytesFields = (totalBytes, dlPct, ulPct) => {
+  if (!totalBytes || totalBytes <= 0) return {};
+  const t = Math.max(0, totalBytes);
+  return {
+    bytes_total: t,
+    bytes_downloaded: Math.min(t, Math.round((t * dlPct) / 100)),
+    bytes_uploaded: Math.min(t, Math.round((t * ulPct) / 100)),
+  };
+};
+
 const asyncPool = async (poolLimit, array, iteratorFn) => {
   const ret = [];
   const executing = new Set();
@@ -19,6 +33,21 @@ const asyncPool = async (poolLimit, array, iteratorFn) => {
   }
   return Promise.all(ret);
 };
+
+/** WebKit/pywebview で fetch/ストリーム失敗時に message が "Load failed" だけになることがある */
+function formatNativeStreamFatalError(err) {
+  const raw = err?.message != null ? String(err.message) : String(err);
+  const name = err?.name ? String(err.name) : '';
+  const prefix = name ? `[${name}] ` : '';
+  if (raw === 'Load failed' || raw === 'Failed to fetch') {
+    return {
+      userMessage:
+        '接続が切断されました（ネットワークの異常、または長時間転送で WebView がストリームを閉じた可能性があります）。desktop/logs/app_latest.log にサーバ側の記録がないか確認してください。',
+      logLine: `${prefix}${raw}`,
+    };
+  }
+  return { userMessage: raw, logLine: `${prefix}${raw}` };
+}
 
 /** ブラウザ移行完了時の OS 通知（ネイティブエンジン時は Python が通知するためスキップ） */
 function notifyMigrationCompleteDesktop(rootFolderName) {
@@ -354,10 +383,20 @@ export const useConverter = (
   const streamUploadFromDropboxToGDrive = async (dropboxUrl, dropboxOptions, metadata, fileSize, mimeType, logId, progressRange) => {
     const [min, max] = progressRange || [0, 100];
     let chunkIndex = 0;
-    const reportProgress = (uploaded) => {
-      const pct = fileSize > 0 ? (uploaded / fileSize) * 100 : 0;
-      const display = Math.round(min + (pct / 100) * (max - min));
-      if (addLog) addLog({ id: logId, progress: display });
+    const reportProgress = (uploadOffset, readTotal) => {
+      const dlPct = fileSize > 0 ? Math.min(100, (readTotal / fileSize) * 100) : 0;
+      const ulPct = fileSize > 0 ? Math.min(100, (uploadOffset / fileSize) * 100) : 0;
+      const comb = (dlPct + ulPct) / 2;
+      const display = Math.round(min + (comb / 100) * (max - min));
+      if (addLog) {
+        addLog({
+          id: logId,
+          progress: display,
+          progress_download: Math.round(dlPct),
+          progress_upload: Math.round(ulPct),
+          ...transferBytesFields(fileSize, dlPct, ulPct),
+        });
+      }
     };
     if (addLog) addLog({ id: logId, message: '分割送信でアップロード中...' });
     console.log('[Resumable] 開始: ファイルサイズ=', fileSize, 'bytes, チャンク=', RESUMABLE_CHUNK_SIZE);
@@ -368,6 +407,7 @@ export const useConverter = (
     const uploadUri = await gDriveResumableInit(metadata, fileSize, mimeType);
     console.log('[Resumable] GDrive init OK、チャンク送信開始');
     let offset = 0;
+    let readBytes = 0;
     let buffer = [];
     let bufferedLen = 0;
     let lastPutRes = null;
@@ -375,6 +415,7 @@ export const useConverter = (
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        readBytes += value.byteLength;
         buffer.push(value);
         bufferedLen += value.byteLength;
         while (bufferedLen >= RESUMABLE_CHUNK_SIZE) {
@@ -409,7 +450,7 @@ export const useConverter = (
           console.log(`[Resumable] チャンク #${chunkIndex} PUT完了 status=${lastPutRes?.status} (進捗${pct}%)`);
           if (!lastPutRes.ok && lastPutRes.status !== 308) return { ok: false, status: lastPutRes.status };
           offset = rangeEnd;
-          reportProgress(offset);
+          reportProgress(offset, readBytes);
         }
       }
       if (bufferedLen > 0) {
@@ -425,10 +466,18 @@ export const useConverter = (
         lastPutRes = await gDriveResumableChunkPut(uploadUri, chunk, offset, rangeEnd, fileSize);
         console.log(`[Resumable] 最終チャンク PUT完了 status=${lastPutRes?.status} (100%)`);
         if (!lastPutRes.ok) return { ok: false, status: lastPutRes.status };
-        reportProgress(rangeEnd);
+        reportProgress(rangeEnd, readBytes);
       }
       console.log('[Resumable] 全チャンク送信完了、progress=max');
-      if (addLog) addLog({ id: logId, progress: max });
+      if (addLog) {
+        addLog({
+          id: logId,
+          progress: max,
+          progress_download: 100,
+          progress_upload: 100,
+          ...transferBytesFields(fileSize, 100, 100),
+        });
+      }
       return { ok: lastPutRes?.ok ?? true, status: lastPutRes?.status ?? 200, json: () => lastPutRes?.json?.() ?? Promise.resolve({}) };
     } finally {
       reader.releaseLock();
@@ -821,6 +870,9 @@ export const useConverter = (
           const t = await res.text();
           throw new Error(t || `HTTP ${res.status}`);
         }
+        if (!res.body) {
+          throw new Error('レスポンスボディがありません（ストリーミング未対応）');
+        }
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let buf = '';
@@ -844,6 +896,7 @@ export const useConverter = (
             } catch {
               continue;
             }
+            if (ev.type === 'ping') continue;
             if (ev.type === 'log' && addLog) {
               const level = ev.level === 'error' ? 'error' : ev.level === 'success' ? 'success' : 'info';
               addLog({
@@ -857,6 +910,11 @@ export const useConverter = (
                 ...(typeof ev.progress_upload === 'number'
                   ? { progress_upload: ev.progress_upload }
                   : {}),
+                ...(typeof ev.bytes_total === 'number' ? { bytes_total: ev.bytes_total } : {}),
+                ...(typeof ev.bytes_downloaded === 'number'
+                  ? { bytes_downloaded: ev.bytes_downloaded }
+                  : {}),
+                ...(typeof ev.bytes_uploaded === 'number' ? { bytes_uploaded: ev.bytes_uploaded } : {}),
               });
               const mid = ev.id && String(ev.id).startsWith('migrate-');
               const msg = ev.message || '';
@@ -872,8 +930,9 @@ export const useConverter = (
         if (fetchGDriveContents) fetchGDriveContents(selectedFolderId);
       } catch (err) {
         console.error('[Migration native]', err);
-        setStatus({ type: 'error', message: err.message || '移行に失敗しました' });
-        log(`致命的なエラー: ${err.message}`, 'error');
+        const { userMessage, logLine } = formatNativeStreamFatalError(err);
+        setStatus({ type: 'error', message: userMessage });
+        log(`致命的なエラー: ${logLine}`, 'error', 'migration-native-fatal');
       } finally {
         setIsGDriveProcessing(false);
       }
@@ -1072,8 +1131,8 @@ export const useConverter = (
           } else {
             // direct transfer for regular files
             const fileSize = file.size || 0;
-            const useResumable = fileSize > RESUMABLE_UPLOAD_THRESHOLD;
-            console.log(`[Migration] ${fileName} size=${fileSize} useResumable=${useResumable} (閾値${RESUMABLE_UPLOAD_THRESHOLD})`);
+            const useResumable = fileSize > STREAMING_MIGRATION_MIN_BYTES;
+            console.log(`[Migration] ${fileName} size=${fileSize} useResumable=${useResumable} (閾値${STREAMING_MIGRATION_MIN_BYTES})`);
             const dropboxOptions = {
               method: 'POST',
               headers: {
@@ -1082,7 +1141,17 @@ export const useConverter = (
               },
               _logId: fileLogId
             };
-            const onProgress = (p) => addLog && addLog({ id: fileLogId, progress: Math.round(p * 0.5) });
+            const onProgress = (p) => {
+              if (!addLog) return;
+              const fs = fileSize || 0;
+              addLog({
+                id: fileLogId,
+                progress: Math.round(p * 0.5),
+                progress_download: p,
+                progress_upload: 0,
+                ...transferBytesFields(fs, p, 0),
+              });
+            };
 
             if (useResumable) {
               const extMatch = fileName.match(/\.([^.]+)$/);
@@ -1162,7 +1231,22 @@ export const useConverter = (
         bumpFilePhaseProgress();
       };
 
-      await asyncPool(MIGRATION_POOL_SIZE, files, processFile);
+      const smallFiles = [];
+      const largeFiles = [];
+      for (const f of files) {
+        const sz = f.size != null ? parseInt(String(f.size), 10) : 0;
+        const isWeb = f.name && f.name.toLowerCase().endsWith('.web');
+        if (!isWeb && sz > STREAMING_MIGRATION_MIN_BYTES) largeFiles.push(f);
+        else smallFiles.push(f);
+      }
+      await Promise.all([
+        asyncPool(MIGRATION_POOL_SIZE, smallFiles, processFile),
+        (async () => {
+          for (const f of largeFiles) {
+            await processFile(f);
+          }
+        })(),
+      ]);
 
       log(`移行進捗: 移行完了 (${files.length}/${files.length})`, 'success', migrationId, 100);
       log(`✅ 全工程が完了しました: "${rootFolderName}" の移行完了`, 'success');
@@ -1256,7 +1340,23 @@ export const useConverter = (
         log(`一括変換進捗: ${processedCount}/${selectedFileIds.length} 完了`, 'info', bulkId, progress);
       };
 
-      await asyncPool(MIGRATION_POOL_SIZE, selectedFileIds, processBulkFile);
+      const smallIds = [];
+      const largeIds = [];
+      for (const path of selectedFileIds) {
+        const file = folderFiles.find((ff) => ff.path_lower === path);
+        const sz = file && file.size != null ? parseInt(String(file.size), 10) : 0;
+        const isWeb = file?.name && file.name.toLowerCase().endsWith('.web');
+        if (file && !isWeb && sz > STREAMING_MIGRATION_MIN_BYTES) largeIds.push(path);
+        else smallIds.push(path);
+      }
+      await Promise.all([
+        asyncPool(MIGRATION_POOL_SIZE, smallIds, processBulkFile),
+        (async () => {
+          for (const path of largeIds) {
+            await processBulkFile(path);
+          }
+        })(),
+      ]);
       setStatus({ type: 'success', message: `${successCount} 個のファイルの変換と保存が完了しました。` });
       log(`一括変換完了: ${successCount}/${selectedFileIds.length} 成功`, 'success', bulkId, 100);
       log(`✅ 一括変換完了: ${successCount}/${selectedFileIds.length} 成功`, 'success');

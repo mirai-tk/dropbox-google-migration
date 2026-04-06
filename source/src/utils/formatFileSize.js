@@ -14,12 +14,17 @@ export function formatFileSize(bytes) {
   const i = Math.min(Math.floor(Math.log(n) / Math.log(k)), units.length - 1);
   const v = n / k ** i;
 
-  const s =
-    i === 0
-      ? String(Math.round(v))
-      : v < 10
-        ? v.toFixed(1).replace(/\.0$/, '')
-        : String(Math.round(v));
+  let s;
+  if (i === 0) {
+    s = String(Math.round(v));
+  } else if (i === 3) {
+    // GB は小数第2位まで（例: 1.23 GB）
+    s = v.toFixed(2);
+  } else if (v < 10) {
+    s = v.toFixed(1).replace(/\.0$/, '');
+  } else {
+    s = String(Math.round(v));
+  }
 
   return `${s} ${units[i]}`;
 }

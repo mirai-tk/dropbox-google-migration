@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { usesBackendOAuth } from '../utils/desktopEnv';
+import { deriveDropboxAccess } from '../utils/accessLevel';
 
 export const useDropbox = (setStatus) => {
   const [dbToken, setDbToken] = useState(localStorage.getItem('dropbox_token'));
@@ -11,6 +12,8 @@ export const useDropbox = (setStatus) => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [exportingId, setExportingId] = useState(null);
   const [rootNamespaceId, setRootNamespaceId] = useState(localStorage.getItem('dropbox_ns_id'));
+  /** list_folder が 409 等で失敗したフォルダ path（小文字）。一覧でグレーアウト */
+  const [inaccessiblePaths, setInaccessiblePaths] = useState(() => new Set());
   const dbTokenRef = useRef(dbToken);
 
   // トークン保存
@@ -61,6 +64,7 @@ export const useDropbox = (setStatus) => {
     setDbToken(null);
     setDbRefreshToken(null);
     setFolderFiles([]);
+    setInaccessiblePaths(new Set());
     if (clearState) {
       // カレントパス・名前空間 ID は再ログイン後も同じフォルダへ戻せるよう保持する
       setStatus({ type: 'info', message: 'Dropbox からログアウトしました' });
@@ -158,6 +162,7 @@ export const useDropbox = (setStatus) => {
     let activeToken = token || dbToken;
     if (!activeToken) return;
 
+    const pathKey = (path || '').toLowerCase();
     setIsProcessing(true);
     try {
       const doList = (t) =>
@@ -187,7 +192,13 @@ export const useDropbox = (setStatus) => {
         handleDropboxLogout(false);
         return;
       }
-      if (!response.ok) throw new Error('フォルダリストの取得に失敗しました');
+      if (!response.ok) {
+        setInaccessiblePaths((prev) => new Set(prev).add(pathKey));
+        const snippet = (await response.text()).slice(0, 400);
+        throw new Error(
+          snippet ? `フォルダリストの取得に失敗しました: ${snippet}` : 'フォルダリストの取得に失敗しました'
+        );
+      }
 
       const data = await response.json();
       // フォルダ優先、その中で名前順にソート
@@ -198,6 +209,11 @@ export const useDropbox = (setStatus) => {
       });
       setFolderFiles(sortedEntries);
       setCurrentPath(path);
+      setInaccessiblePaths((prev) => {
+        const n = new Set(prev);
+        n.delete(pathKey);
+        return n;
+      });
     } catch (err) {
       setStatus({ type: 'error', message: err.message });
     } finally {
@@ -216,13 +232,15 @@ export const useDropbox = (setStatus) => {
   }, []);
 
   const toggleAllFiles = useCallback(() => {
-    const filesOnly = folderFiles.filter(f => f['.tag'] === 'file');
+    const filesOnly = folderFiles.filter(
+      (f) => f['.tag'] === 'file' && deriveDropboxAccess(f, inaccessiblePaths) !== 'none'
+    );
     if (selectedFileIds.length === filesOnly.length && filesOnly.length > 0) {
       setSelectedFileIds([]);
     } else {
-      setSelectedFileIds(filesOnly.map(f => f.path_lower));
+      setSelectedFileIds(filesOnly.map((f) => f.path_lower));
     }
-  }, [folderFiles, selectedFileIds]);
+  }, [folderFiles, selectedFileIds, inaccessiblePaths]);
 
   const getBreadcrumbs = useCallback(() => {
     if (!currentPath || currentPath === '/') return [{ name: 'Home', path: '' }];
@@ -368,6 +386,7 @@ export const useDropbox = (setStatus) => {
     handleDropboxLogout,
     refreshDropboxToken,
     checkConnection,
+    inaccessiblePaths,
     listFolderContent,
     handleFolderClick,
     toggleFileSelection,

@@ -47,3 +47,13 @@ def dist_dir() -> Path:
         return Path(sys._MEIPASS) / "static"
     return _REPO_ROOT / "source" / "dist"
 
+
+def migration_resume_checkpoints_enabled() -> bool:
+    """1GB+ のディスクレジューム（チェックポイント）を使うか。
+
+    無効にするとレジューム関連のコードパスに入らず、追加前の転送挙動に近い。
+    環境変数 ENABLE_MIGRATION_RESUME_CHECKPOINTS: 既定 1。0 / false / no / off でオフ。
+    """
+    v = os.environ.get("ENABLE_MIGRATION_RESUME_CHECKPOINTS", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+

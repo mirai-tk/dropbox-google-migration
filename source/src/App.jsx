@@ -15,6 +15,8 @@ import { LogViewer } from './components/LogViewer';
 import { StatusToast } from './components/StatusToast';
 import { FolderPickerModal } from './components/FolderPickerModal';
 import { isDesktopShell, usesBackendOAuth } from './utils/desktopEnv';
+import { shouldIgnoreEnterForSubmit } from './utils/imeEnter';
+import { deriveDropboxAccess, deriveGDriveAccess } from './utils/accessLevel';
 
 const App = () => {
   /** /api/app/shell 確定後に再レンダー（sessionStorage と Keychain 復元のため） */
@@ -925,16 +927,17 @@ const App = () => {
                     onBreadcrumbClick={(idx) => dropbox.handleFolderClick(dropbox.getBreadcrumbs()[idx].path)}
                     isLoading={dropbox.isProcessing}
                     loadingText="Dropbox 読み込み中..."
+                    scrollContextKey={dropbox.currentPath === '/' ? '' : dropbox.currentPath}
                     items={dropbox.folderFiles}
                     emptyIcon={Folder}
                     renderItem={(f, idx) => (
                       <FileListItem
-                        key={idx}
+                        key={f.path_lower}
                         item={f}
                         isFolder={f['.tag'] === 'folder'}
                         isSelected={dropbox.selectedFileIds.includes(f.path_lower)}
                         onToggleSelect={() => dropbox.toggleFileSelection(f.path_lower)}
-                        onItemClick={() => f['.tag'] === 'folder' ? dropbox.handleFolderClick(f.path_display) : dropbox.toggleFileSelection(f.path_lower)}
+                        onItemClick={() => f['.tag'] === 'folder' ? dropbox.handleFolderClick(f.path_lower ?? f.path_display) : dropbox.toggleFileSelection(f.path_lower)}
                         showSelect={true}
                         showArrow={f['.tag'] !== 'folder'}
                         onArrowClick={() => converter.fetchAndExport(f.path_lower, f.name, f.is_downloadable === false)}
@@ -943,6 +946,7 @@ const App = () => {
                         onRecursiveMigrateClick={() => converter.migrateFolderRecursively(f.path_lower, f.name, addLog)}
                         onRename={(newName) => dropbox.renameDropboxFolder(f.path_lower, newName)}
                         type="dropbox"
+                        accessLevel={deriveDropboxAccess(f, dropbox.inaccessiblePaths)}
                       />
                     )}
                     infoBar={
@@ -950,7 +954,15 @@ const App = () => {
                         <div className="flex items-center gap-2">
                           <input
                             type="checkbox"
-                            checked={dropbox.selectedFileIds.length === dropbox.folderFiles.filter(f => f['.tag'] === 'file').length && dropbox.selectedFileIds.length > 0}
+                            checked={(() => {
+                              const eligible = dropbox.folderFiles.filter(
+                                (x) => x['.tag'] === 'file' && deriveDropboxAccess(x, dropbox.inaccessiblePaths) !== 'none'
+                              );
+                              return (
+                                eligible.length > 0 &&
+                                eligible.every((x) => dropbox.selectedFileIds.includes(x.path_lower))
+                              );
+                            })()}
                             onChange={dropbox.toggleAllFiles}
                             className="w-3 h-3 rounded"
                           />
@@ -1041,11 +1053,12 @@ const App = () => {
                     onBreadcrumbClick={gdrive.navigateGDriveBrowserTo}
                     isLoading={gdrive.gDriveBrowserLoading}
                     loadingText="Google Drive 読み込み中..."
+                    scrollContextKey={gdrive.gDriveBrowserPath[gdrive.gDriveBrowserPath.length - 1]?.id ?? 'home'}
                     items={gdrive.gDriveBrowserFiles}
                     emptyIcon={HardDrive}
                     renderItem={(f, idx) => (
                       <FileListItem
-                        key={idx}
+                        key={f.id}
                         item={f}
                         isFolder={f.mimeType === 'application/vnd.google-apps.folder'}
                         onItemClick={() => gdrive.navigateGDriveBrowser(f.id, f.name)}
@@ -1055,6 +1068,7 @@ const App = () => {
                         showDuplicateButton={f.mimeType === 'application/vnd.google-apps.folder' && !f.isRoot && !f.isSharedDrive}
                         onDuplicateClick={() => gdrive.duplicateGDriveFolder(f.id, f.name, gdrive.gDriveBrowserPath[gdrive.gDriveBrowserPath.length - 1].id)}
                         type="gdrive"
+                        accessLevel={deriveGDriveAccess(f)}
                       />
                     )}
                     infoBar={gdrive.gDriveToken ? (
@@ -1117,7 +1131,12 @@ const App = () => {
                               type="text"
                               value={gdrive.newFolderName}
                               onChange={(e) => gdrive.setNewFolderName(e.target.value)}
-                              onKeyDown={(e) => e.key === 'Enter' && !e.nativeEvent.isComposing && gdrive.createGDriveFolder(gdrive.gDriveToken, gdrive.gDriveBrowserPath[gdrive.gDriveBrowserPath.length - 1].id, gdrive.newFolderName)}
+                              onKeyDown={(e) => {
+                                if (e.key !== 'Enter') return;
+                                if (shouldIgnoreEnterForSubmit(e)) return;
+                                e.preventDefault();
+                                gdrive.createGDriveFolder(gdrive.gDriveToken, gdrive.gDriveBrowserPath[gdrive.gDriveBrowserPath.length - 1].id, gdrive.newFolderName);
+                              }}
                               placeholder="フォルダ名を入力..."
                               autoFocus
                               className="w-full bg-white border border-emerald-200 rounded-lg px-2 py-1.5 text-xs focus:outline-none"

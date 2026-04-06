@@ -41,7 +41,9 @@ source .venv/bin/activate          # fish なら: source .venv/bin/activate.fish
 python run_desktop.py
 ```
 
-アプリ全体のログは既定で **`desktop/logs/app.log`**（ローテーション付き）に出力されます。より詳細な DEBUG（マイグレーション／Paper 調査用）にする場合は `python run_desktop.py --dev`、または `.env` に `PAPER_MIGRATOR_DEV=1`。パスを変えるときは環境変数 `PAPER_MIGRATOR_LOG_FILE`。
+**リポジトリルートから `python desktop/run_desktop.py` だけ叩くと、venv ではない Python が使われ `ModuleNotFoundError: keyring` などになることがあります。** 上のように `cd desktop` してから venv を有効化するか、ルートからなら `desktop/.venv/bin/python desktop/run_desktop.py` のように **venv の `python` を明示**してください。
+
+アプリ全体のログは既定で **`desktop/logs/app_latest.log`**（ローテーション付き）に出力されます。起動時に `_latest.log` が既にあれば、前回分を **`desktop/logs/log_YYYYMMDD_HHMMSS.log`** にリネームしてから書き込みます。より詳細な DEBUG（マイグレーション／Paper 調査用）にする場合は `python run_desktop.py --dev`、または `.env` に `PAPER_MIGRATOR_DEV=1`。パスを変えるときは環境変数 `PAPER_MIGRATOR_LOG_FILE`（`*_latest.log` で終わるパスなら同様に起動時退避します）。
 
 ブラウザではなく **pywebview** のウィンドウが開き、`127.0.0.1:8765` で FastAPI が UI と `/api/*` を提供します。
 

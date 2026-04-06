@@ -32,7 +32,7 @@ def main() -> None:
     parser.add_argument(
         "--dev",
         action="store_true",
-        help="開発モード: アプリログを DEBUG 詳細に（PAPER_MIGRATOR_DEV と同じ。既定の出力先は desktop/logs/app.log）",
+        help="開発モード: アプリログを DEBUG 詳細に（PAPER_MIGRATOR_DEV と同じ。既定は desktop/logs/app_latest.log）",
     )
     args = parser.parse_args()
     if args.dev:
@@ -82,6 +82,7 @@ def main() -> None:
         width=1280,
         height=900,
         js_api=DesktopApi(),
+        text_select=True,
     )
     webview.start()
 

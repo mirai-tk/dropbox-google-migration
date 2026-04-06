@@ -8,6 +8,13 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* pywebview / WKWebView では既定でドラッグ選択が効きにくいことがあるため、ログ本体だけ明示 */
+.migration-console-log,
+.migration-console-log * {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+
 /* Custom Scrollbar */
 .custom-scrollbar::-webkit-scrollbar {
   width: 6px;

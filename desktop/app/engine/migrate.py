@@ -4,15 +4,18 @@ from __future__ import annotations
 import asyncio
 import gc
 import json
+import time
 import logging
+import re
 import secrets
 import string
-from collections.abc import Awaitable, Callable
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Any
 from urllib.parse import quote
 
 import httpx
 
+from ..config import migration_resume_checkpoints_enabled
 from ..dropbox_oauth_refresh import (
     dropbox_request_with_token_refresh,
     refresh_dropbox_access_token,
@@ -22,21 +25,85 @@ from ..google_docs_checklist import convert_task_markers_to_native_checklists
 from ..google_oauth_refresh import google_request_with_token_refresh
 from ..migration_auth import MigrationAuthError
 from .paper_docx import clean_markdown, markdown_to_docx_bytes
+from .resume_checkpoint import (
+    checkpoint_id_for_file,
+    delete_checkpoint,
+    load_checkpoint,
+    save_checkpoint_atomic,
+)
 
 logger = logging.getLogger(__name__)
 
+# 軽いファイルの同時処理数（大容量は large_sem で 1 件ずつ）
 MIGRATION_POOL_SIZE = 5
-RESUMABLE_UPLOAD_THRESHOLD = 400 * 1024 * 1024
-RESUMABLE_CHUNK_SIZE = 256 * 1024
-RESUMABLE_CHUNK_PUT_RETRIES = 4
+# これを超える通常ファイルは Dropbox ストリーム → GDrive resumable（フルバッファを避ける）
+# かつこの閾値超は並列プールではなく直列（他と重ならない）
+STREAMING_MIGRATION_MIN_BYTES = 80 * 1024 * 1024
+# Google resumable は 256KiB 以上の倍数。ファイルサイズ帯でチャンクを変える（PUT 回数とメモリのバランス）
+RESUMABLE_CHUNK_TIER_LT16 = 256 * 1024  # 16MB 未満
+RESUMABLE_CHUNK_TIER_16_50 = 8 * 1024 * 1024  # 16MB 以上 50MB 未満
+RESUMABLE_CHUNK_TIER_50_400 = 16 * 1024 * 1024  # 50MB 以上 400MB 未満
+RESUMABLE_CHUNK_TIER_GE400 = 32 * 1024 * 1024  # 400MB 以上
+_RESUMABLE_BOUND_16 = 16 * 1024 * 1024
+_RESUMABLE_BOUND_50 = 50 * 1024 * 1024
+_RESUMABLE_BOUND_400 = 400 * 1024 * 1024
+
+
+def _resumable_chunk_size_for_file(file_size: int) -> int:
+    if file_size >= _RESUMABLE_BOUND_400:
+        return RESUMABLE_CHUNK_TIER_GE400
+    if file_size >= _RESUMABLE_BOUND_50:
+        return RESUMABLE_CHUNK_TIER_50_400
+    if file_size >= _RESUMABLE_BOUND_16:
+        return RESUMABLE_CHUNK_TIER_16_50
+    return RESUMABLE_CHUNK_TIER_LT16
+RESUMABLE_CHUNK_PUT_MAX_ATTEMPTS = 8
 RESUMABLE_CHUNK_PUT_TIMEOUT = 600.0
+# Google が返す一時障害（503 transientError 等）・レート制限
+GDRIVE_TRANSIENT_HTTP_CODES = frozenset({408, 429, 500, 502, 503, 504})
+GDRIVE_MULTIPART_UPLOAD_RETRIES = 5
+RESUMABLE_SESSION_INIT_RETRIES = 5
+# Dropbox ストリーム切断（RemoteProtocolError）時に resumable パイプライン全体をやり直す回数
+RESUMABLE_FULL_PIPELINE_RETRIES = 8
+# Dropbox 公式フォーラム推奨: 長時間単一接続は ~1h で切れるため Range でチャンク化
+DROPBOX_DOWNLOAD_SEGMENT_BYTES = 64 * 1024 * 1024
+DROPBOX_SEGMENT_GET_RETRIES = 5
 # Web の GDRIVE_STREAM_THRESHOLD（5MB）と同じ閾値は useConverter.js にある。Python エンジンは常に multipart/related をチャンク送信し送信中バイトで UL 進捗を付ける。
 CHECKPOINT_EVERY = 50
+# WebKit/pywebview が長時間 NDJSON にバイトが無いと fetch を切ることがある。
+# 同一 (合成%, DL%, UL%) の連打は間引き、キュー待ちは ping で TCP を生かす。
+PROGRESS_EMIT_MIN_INTERVAL_SAME_SIG_S = 2.0
+MIGRATE_STREAM_PING_INTERVAL_S = 20.0
+# 1GB 以上の通常ファイルのみディスクにチェックポイントを書き、Google レジュームと組み合わせる
+# 無効化は ENABLE_MIGRATION_RESUME_CHECKPOINTS=0（レジューム機能を入れる前の挙動に近づける・コードはそのまま）
+RESUME_CHECKPOINT_MIN_BYTES = 1 * 1024 * 1024 * 1024
+
+class ResumeSessionExpiredError(Exception):
+    """Google の resumable セッションが無効（404 等）。チェックポイントを捨てて最初からやり直す。"""
+
 
 # GDrive への送信パターン（フロントの gUpload / migrateFolderRecursively と対応）
-# 1) 通常ファイルかつサイズ > RESUMABLE_UPLOAD_THRESHOLD → resumable（gdrive_resumable_upload_stream）
-# 2) 通常ファイルかつサイズ ≤ 閾値、または Paper → multipart（gdrive_multipart_upload）
-# 3) multipart: 閾値以下は Web と同じ FormData（multipart/form-data）、超は related ストリーム
+# 1) 通常ファイルかつサイズ > STREAMING_MIGRATION_MIN_BYTES → resumable（gdrive_resumable_upload_stream）
+# 2) 通常ファイルかつサイズ ≤ 上記、または Paper → multipart（gdrive_multipart_upload）
+# 3) multipart: 小容量は Web と同じ FormData（multipart/form-data）、超は related ストリーム
+
+def _gdrive_http_is_transient(status: int) -> bool:
+    return status in GDRIVE_TRANSIENT_HTTP_CODES
+
+
+def _is_streaming_migration_retryable(exc: BaseException) -> bool:
+    """Dropbox→G ストリーミング中の接続切れなど、ラウンド全体の再試行に値するもの。"""
+    return isinstance(
+        exc,
+        (
+            httpx.RemoteProtocolError,
+            httpx.ReadError,
+            httpx.WriteError,
+            httpx.ConnectError,
+            httpx.TimeoutException,
+        ),
+    )
+
 
 MIME_EXT = {
     "pdf": "application/pdf",
@@ -83,6 +150,183 @@ def _dropbox_http_error_detail(r: httpx.Response) -> str:
     """content.dropboxapi.com の失敗理由（認証切れは多くが 401）。"""
     snippet = (r.text or "").strip().replace("\n", " ")[:1200]
     return f"HTTP {r.status_code}" + (f" — {snippet}" if snippet else "")
+
+
+async def _iter_dropbox_single_stream_download(
+    client: httpx.AsyncClient,
+    dropbox_token_ref: list[str],
+    d_refresh: str | None,
+    dropbox_ns_id: str | None,
+    path_lower: str,
+    fsize: int,
+    set_dl: Callable[..., Awaitable[None]],
+) -> AsyncIterator[bytes]:
+    """Range なしの一括ダウンロード（Range 未対応時のフォールバック）。"""
+    attempt = 0
+    while True:
+        async with client.stream(
+            "POST",
+            "https://content.dropboxapi.com/2/files/download",
+            headers={
+                **dropbox_headers(dropbox_token_ref[0], True, dropbox_ns_id),
+                "Dropbox-API-Arg": ascii_safe_json({"path": path_lower}),
+            },
+        ) as resp:
+            if (
+                resp.status_code == 401
+                and attempt == 0
+                and d_refresh
+                and await refresh_dropbox_access_token(
+                    client, dropbox_token_ref, d_refresh
+                )
+            ):
+                attempt += 1
+                continue
+            if resp.status_code == 401:
+                raise MigrationAuthError(
+                    "Dropbox の認証が無効です（ストリームダウンロード）。"
+                    " Dropbox に再接続してから再度お試しください。"
+                )
+            resp.raise_for_status()
+            loaded = 0
+            async for ch in resp.aiter_bytes():
+                loaded += len(ch)
+                if fsize > 0:
+                    await set_dl(int(loaded / fsize * 100), loaded)
+                yield ch
+            return
+
+
+async def _iter_dropbox_segmented_download(
+    client: httpx.AsyncClient,
+    dropbox_token_ref: list[str],
+    d_refresh: str | None,
+    dropbox_ns_id: str | None,
+    path_lower: str,
+    fsize: int,
+    set_dl: Callable[..., Awaitable[None]],
+    resume_from_byte: int = 0,
+) -> AsyncIterator[bytes]:
+    """HTTP Range でセグメント取得。長尺単一接続の切断を避ける。
+
+    resume_from_byte: レジューム時にこのバイト位置から読み直す（Google 側オフセットと一致させる）。
+    """
+    if fsize <= 0:
+        async for ch in _iter_dropbox_single_stream_download(
+            client,
+            dropbox_token_ref,
+            d_refresh,
+            dropbox_ns_id,
+            path_lower,
+            fsize,
+            set_dl,
+        ):
+            yield ch
+        return
+
+    if resume_from_byte >= fsize:
+        return
+    start = max(0, resume_from_byte)
+    while start < fsize:
+        end = min(start + DROPBOX_DOWNLOAD_SEGMENT_BYTES - 1, fsize - 1)
+        expected = end - start + 1
+
+        for seg_try in range(DROPBOX_SEGMENT_GET_RETRIES):
+            try:
+                attempt = 0
+                while True:
+                    async with client.stream(
+                        "POST",
+                        "https://content.dropboxapi.com/2/files/download",
+                        headers={
+                            **dropbox_headers(
+                                dropbox_token_ref[0], True, dropbox_ns_id
+                            ),
+                            "Dropbox-API-Arg": ascii_safe_json({"path": path_lower}),
+                            "Range": f"bytes={start}-{end}",
+                        },
+                    ) as resp:
+                        if (
+                            resp.status_code == 401
+                            and attempt == 0
+                            and d_refresh
+                            and await refresh_dropbox_access_token(
+                                client, dropbox_token_ref, d_refresh
+                            )
+                        ):
+                            attempt += 1
+                            continue
+                        if resp.status_code == 401:
+                            raise MigrationAuthError(
+                                "Dropbox の認証が無効です（ストリームダウンロード）。"
+                                " Dropbox に再接続してから再度お試しください。"
+                            )
+                        if resp.status_code == 416:
+                            logger.warning(
+                                "Dropbox Range 非対応 (416)、一括ストリームに切り替えます path=%s",
+                                path_lower,
+                            )
+                            async for ch in _iter_dropbox_single_stream_download(
+                                client,
+                                dropbox_token_ref,
+                                d_refresh,
+                                dropbox_ns_id,
+                                path_lower,
+                                fsize,
+                                set_dl,
+                            ):
+                                yield ch
+                            return
+                        if resp.status_code not in (200, 206):
+                            await resp.aread()
+                            raise RuntimeError(
+                                f"Dropbox segment HTTP {resp.status_code} "
+                                f"bytes={start}-{end}"
+                            )
+                        received = 0
+                        async for ch in resp.aiter_bytes():
+                            take = ch
+                            if received + len(take) > expected:
+                                take = take[: expected - received]
+                            received += len(take)
+                            if fsize > 0:
+                                tot = start + received
+                                await set_dl(
+                                    min(100, int(tot / fsize * 100)), tot
+                                )
+                            if take:
+                                yield take
+                            if received >= expected:
+                                break
+                        if received < expected:
+                            raise httpx.RemoteProtocolError(
+                                f"Dropbox segment short read: got {received} want {expected}"
+                            )
+                    break
+                break
+            except MigrationAuthError:
+                raise
+            except Exception as e:
+                if seg_try >= DROPBOX_SEGMENT_GET_RETRIES - 1:
+                    raise
+                if not _is_streaming_migration_retryable(e):
+                    raise
+                delay = min(2.0 * (2**seg_try), 60.0)
+                logger.warning(
+                    "Dropbox セグメント DL リトライ (%d/%d) bytes %d-%d: %s",
+                    seg_try + 1,
+                    DROPBOX_SEGMENT_GET_RETRIES,
+                    start,
+                    end,
+                    e,
+                )
+                await asyncio.sleep(delay)
+        else:
+            raise httpx.RemoteProtocolError(
+                f"Dropbox segment failed after retries bytes {start}-{end}"
+            )
+
+        start = end + 1
 
 
 async def list_folder_recursive(
@@ -327,27 +571,44 @@ async def gdrive_multipart_upload(
             if on_body_progress:
                 await on_body_progress(i, total)
 
-    r = await google_request_with_token_refresh(
-        client,
-        token_ref,
-        refresh,
-        lambda tok: client.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {tok}",
-                "Content-Type": f"multipart/related; boundary={boundary}",
-            },
-            content=stream_body(),
-            timeout=600.0,
-        ),
-    )
-    if not r.is_success:
-        logger.error(
-            "gdrive_multipart_upload (chunked) failed status=%s meta=%s body=%s",
-            r.status_code,
-            meta_str[:2000],
-            (r.text or "")[:4000],
+    delay = 1.5
+    r: httpx.Response | None = None
+    for attempt in range(GDRIVE_MULTIPART_UPLOAD_RETRIES):
+        if on_body_progress:
+            await on_body_progress(0, total)
+        r = await google_request_with_token_refresh(
+            client,
+            token_ref,
+            refresh,
+            lambda tok: client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {tok}",
+                    "Content-Type": f"multipart/related; boundary={boundary}",
+                },
+                content=stream_body(),
+                timeout=600.0,
+            ),
         )
+        if r.is_success:
+            break
+        if not _gdrive_http_is_transient(r.status_code) or attempt >= GDRIVE_MULTIPART_UPLOAD_RETRIES - 1:
+            logger.error(
+                "gdrive_multipart_upload (chunked) failed status=%s meta=%s body=%s",
+                r.status_code,
+                meta_str[:2000],
+                (r.text or "")[:4000],
+            )
+            return None
+        logger.info(
+            "gdrive_multipart_upload transient HTTP %s, retry %d/%d",
+            r.status_code,
+            attempt + 1,
+            GDRIVE_MULTIPART_UPLOAD_RETRIES,
+        )
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 60.0)
+    if r is None or not r.is_success:
         return None
     if on_body_progress:
         await on_body_progress(total, total)
@@ -367,11 +628,11 @@ async def _put_resumable_chunk(
     piece: bytes,
     content_range: str,
 ) -> httpx.Response | None:
-    """resumable セッションへのチャンク PUT。応答受信前に切れる ReadError 等は再試行する。"""
+    """resumable セッションへのチャンク PUT。Transport 失敗と 429/5xx 一時障害を再試行する。"""
     delay = 1.5
-    for attempt in range(RESUMABLE_CHUNK_PUT_RETRIES):
+    for attempt in range(RESUMABLE_CHUNK_PUT_MAX_ATTEMPTS):
         try:
-            return await google_request_with_token_refresh(
+            r = await google_request_with_token_refresh(
                 client,
                 token_ref,
                 refresh,
@@ -387,23 +648,113 @@ async def _put_resumable_chunk(
                 ),
             )
         except httpx.TransportError as e:
-            if attempt >= RESUMABLE_CHUNK_PUT_RETRIES - 1:
+            if attempt >= RESUMABLE_CHUNK_PUT_MAX_ATTEMPTS - 1:
                 logger.warning(
                     "resumable chunk PUT failed after %d attempts: %s",
-                    RESUMABLE_CHUNK_PUT_RETRIES,
+                    RESUMABLE_CHUNK_PUT_MAX_ATTEMPTS,
                     e,
                     exc_info=True,
                 )
                 return None
             logger.info(
-                "resumable chunk PUT retry %d/%d: %s",
+                "resumable chunk PUT transport retry %d/%d: %s",
                 attempt + 1,
-                RESUMABLE_CHUNK_PUT_RETRIES,
+                RESUMABLE_CHUNK_PUT_MAX_ATTEMPTS,
                 e,
             )
             await asyncio.sleep(delay)
             delay = min(delay * 2, 30.0)
+            continue
+        if not _gdrive_http_is_transient(r.status_code):
+            return r
+        if attempt >= RESUMABLE_CHUNK_PUT_MAX_ATTEMPTS - 1:
+            return r
+        logger.info(
+            "resumable chunk PUT HTTP %s retry %d/%d",
+            r.status_code,
+            attempt + 1,
+            RESUMABLE_CHUNK_PUT_MAX_ATTEMPTS,
+        )
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 30.0)
     return None
+
+
+async def _query_gdrive_resumable_offset(
+    client: httpx.AsyncClient,
+    token_ref: list[str],
+    refresh: str | None,
+    location: str,
+    file_size: int,
+) -> int | None:
+    """レジュームセッションの次バイト位置。完了済みは file_size。セッション無効は None。"""
+    r = await google_request_with_token_refresh(
+        client,
+        token_ref,
+        refresh,
+        lambda tok: client.put(
+            location,
+            headers={
+                "Authorization": f"Bearer {tok}",
+                "Content-Length": "0",
+                "Content-Range": f"bytes */{file_size}",
+            },
+            content=b"",
+            timeout=RESUMABLE_CHUNK_PUT_TIMEOUT,
+        ),
+    )
+    if r.status_code in (200, 201):
+        return file_size
+    if r.status_code == 404:
+        logger.info("resumable session expired (404) for status query")
+        return None
+    if r.status_code == 308:
+        rng = (r.headers.get("Range") or r.headers.get("range") or "").strip()
+        if not rng:
+            return 0
+        m = re.match(r"^\s*bytes\s*=\s*(\d+)\s*-\s*(\d+)\s*$", rng, re.I)
+        if m:
+            return int(m.group(2)) + 1
+        return 0
+    logger.warning(
+        "query resumable offset: unexpected status=%s body=%s",
+        r.status_code,
+        (r.text or "")[:500],
+    )
+    return None
+
+
+async def gdrive_resumable_cancel(
+    client: httpx.AsyncClient,
+    token_ref: list[str],
+    refresh: str | None,
+    location: str,
+) -> bool:
+    """未完了の resumable セッションを破棄（ロールバック用）。"""
+    try:
+        r = await google_request_with_token_refresh(
+            client,
+            token_ref,
+            refresh,
+            lambda tok: client.delete(
+                location,
+                headers={"Authorization": f"Bearer {tok}"},
+                timeout=60.0,
+            ),
+        )
+        if r.status_code in (204, 200):
+            return True
+        if r.status_code == 404:
+            return True
+        logger.warning(
+            "resumable cancel: status=%s body=%s",
+            r.status_code,
+            (r.text or "")[:300],
+        )
+        return False
+    except Exception:
+        logger.exception("resumable cancel failed")
+        return False
 
 
 async def gdrive_resumable_upload_stream(
@@ -413,42 +764,82 @@ async def gdrive_resumable_upload_stream(
     metadata: dict,
     file_size: int,
     mime_type: str,
-    body_iter,
+    body_factory: Callable[[int], AsyncIterator[bytes]],
     on_upload_progress: Callable[[int], Awaitable[None]] | None = None,
+    *,
+    resume_location: str | None = None,
+    on_checkpoint: Callable[[int, str], Awaitable[None]] | None = None,
 ) -> bool:
-    r0 = await google_request_with_token_refresh(
-        client,
-        token_ref,
-        refresh,
-        lambda tok: client.post(
-            "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true",
-            headers={
-                "Authorization": f"Bearer {tok}",
-                "Content-Type": "application/json; charset=UTF-8",
-                "X-Upload-Content-Length": str(file_size),
-                "X-Upload-Content-Type": mime_type or "application/octet-stream",
-            },
-            json=metadata,
-        ),
-    )
-    if not r0.is_success:
-        return False
-    location = r0.headers.get("Location")
-    if not location:
-        return False
-
+    delay = 1.5
+    r0: httpx.Response | None = None
+    location: str | None = None
     offset = 0
+
+    if resume_location:
+        location = resume_location
+        q = await _query_gdrive_resumable_offset(
+            client, token_ref, refresh, location, file_size
+        )
+        if q is None:
+            raise ResumeSessionExpiredError("resumable session invalid or expired")
+        if q >= file_size:
+            if on_upload_progress:
+                await on_upload_progress(100)
+            return True
+        offset = q
+        if on_checkpoint:
+            await on_checkpoint(offset, location)
+    else:
+        for attempt in range(RESUMABLE_SESSION_INIT_RETRIES):
+            r0 = await google_request_with_token_refresh(
+                client,
+                token_ref,
+                refresh,
+                lambda tok: client.post(
+                    "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true",
+                    headers={
+                        "Authorization": f"Bearer {tok}",
+                        "Content-Type": "application/json; charset=UTF-8",
+                        "X-Upload-Content-Length": str(file_size),
+                        "X-Upload-Content-Type": mime_type or "application/octet-stream",
+                    },
+                    json=metadata,
+                ),
+            )
+            if r0.is_success:
+                break
+            if not _gdrive_http_is_transient(r0.status_code) or attempt >= RESUMABLE_SESSION_INIT_RETRIES - 1:
+                return False
+            logger.info(
+                "resumable session init HTTP %s retry %d/%d",
+                r0.status_code,
+                attempt + 1,
+                RESUMABLE_SESSION_INIT_RETRIES,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60.0)
+        if r0 is None or not r0.is_success:
+            return False
+        location = r0.headers.get("Location")
+        if not location:
+            return False
+        offset = 0
+        if on_checkpoint:
+            await on_checkpoint(0, location)
+
+    assert location is not None
+
+    chunk_sz = _resumable_chunk_size_for_file(file_size)
+    body_iter = body_factory(offset)
     buf = bytearray()
     async for chunk in body_iter:
         buf.extend(chunk)
-        while len(buf) >= RESUMABLE_CHUNK_SIZE or (
+        while len(buf) >= chunk_sz or (
             len(buf) > 0 and offset + len(buf) >= file_size
         ):
             take = min(
                 len(buf),
-                RESUMABLE_CHUNK_SIZE
-                if offset + len(buf) < file_size
-                else len(buf),
+                chunk_sz if offset + len(buf) < file_size else len(buf),
             )
             if take == 0:
                 break
@@ -465,6 +856,8 @@ async def gdrive_resumable_upload_stream(
             if on_upload_progress and file_size > 0:
                 up_pct = int((offset / file_size) * 100)
                 await on_upload_progress(min(100, up_pct))
+            if on_checkpoint:
+                await on_checkpoint(offset, location)
             if offset >= file_size:
                 if on_upload_progress:
                     await on_upload_progress(100)
@@ -478,6 +871,8 @@ async def gdrive_resumable_upload_stream(
         )
         if r is None or r.status_code not in (200, 201):
             return False
+        if on_checkpoint:
+            await on_checkpoint(range_end, location)
         if on_upload_progress:
             await on_upload_progress(100)
         return True
@@ -514,7 +909,10 @@ async def run_folder_migration(
     event_q: asyncio.Queue = asyncio.Queue()
     completed = 0
     lock = asyncio.Lock()
-    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
+    # read=None: 大容量のストリームが「読み取り間隔」で 600s を超えても切らない
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=120.0, read=None, write=120.0, pool=120.0)
+    ) as client:
         migration_aborted = False
         try:
             all_entries = await list_folder_recursive(
@@ -652,7 +1050,8 @@ async def run_folder_migration(
             }
     
             sem = asyncio.Semaphore(MIGRATION_POOL_SIZE)
-    
+            large_sem = asyncio.Semaphore(1)
+
             async def process_file(file: dict) -> None:
                 nonlocal completed
                 path_lower = file["path_lower"]
@@ -667,32 +1066,70 @@ async def run_folder_migration(
                 # Dropbox→GDrive は DL/UL を別スケールで保持し、合成 progress=(dl+ul)/2（上書きで 50% 固定に見えるのを防ぐ）
                 dl_pct = [0]
                 ul_pct = [0]
+                dl_bytes = [0]
+                ul_bytes = [0]
+                bytes_total = [0]
+                last_emit_sig: list[tuple[int, int, int] | None] = [None]
+                last_emit_ts = [0.0]
 
                 async def emit_file_progress() -> None:
                     comb = int((dl_pct[0] + ul_pct[0]) / 2)
                     comb = min(100, max(0, comb))
-                    await event_q.put(
-                        {
-                            "type": "log",
-                            "id": file_log_id,
-                            "message": f"ファイル移行中: {rel}...",
-                            "progress": comb,
-                            "progress_download": dl_pct[0],
-                            "progress_upload": ul_pct[0],
-                            "level": "info",
-                        }
-                    )
+                    sig = (comb, dl_pct[0], ul_pct[0])
+                    now = time.monotonic()
+                    if last_emit_sig[0] is not None:
+                        elapsed = now - last_emit_ts[0]
+                        if (
+                            sig == last_emit_sig[0]
+                            and elapsed < PROGRESS_EMIT_MIN_INTERVAL_SAME_SIG_S
+                        ):
+                            return
+                    last_emit_sig[0] = sig
+                    last_emit_ts[0] = now
+                    ev: dict[str, Any] = {
+                        "type": "log",
+                        "id": file_log_id,
+                        "message": f"ファイル移行中: {rel}...",
+                        "progress": comb,
+                        "progress_download": dl_pct[0],
+                        "progress_upload": ul_pct[0],
+                        "level": "info",
+                    }
+                    bt = bytes_total[0]
+                    if bt > 0:
+                        ev["bytes_total"] = bt
+                        ev["bytes_downloaded"] = min(bt, dl_bytes[0])
+                        ev["bytes_uploaded"] = min(bt, ul_bytes[0])
+                    await event_q.put(ev)
                     await asyncio.sleep(0)
 
-                async def set_dl(p: int) -> None:
+                async def set_dl(p: int, exact_bytes: int | None = None) -> None:
                     dl_pct[0] = min(100, max(0, p))
+                    bt = bytes_total[0]
+                    if bt > 0:
+                        if exact_bytes is not None:
+                            dl_bytes[0] = min(bt, max(0, exact_bytes))
+                        else:
+                            dl_bytes[0] = min(bt, int(bt * dl_pct[0] / 100))
                     await emit_file_progress()
 
-                async def set_ul(p: int) -> None:
+                async def set_ul(p: int, exact_bytes: int | None = None) -> None:
                     ul_pct[0] = min(100, max(0, p))
+                    bt = bytes_total[0]
+                    if bt > 0:
+                        if exact_bytes is not None:
+                            ul_bytes[0] = min(bt, max(0, exact_bytes))
+                        else:
+                            ul_bytes[0] = min(bt, int(bt * ul_pct[0] / 100))
                     await emit_file_progress()
-    
-                async with sem:
+
+                raw_size = int(file.get("size") or 0)
+                use_serial_large = (
+                    not file_name.lower().endswith(".web")
+                    and raw_size > STREAMING_MIGRATION_MIN_BYTES
+                )
+
+                async with (large_sem if use_serial_large else sem):
                     try:
                         n_files = len(files)
     
@@ -710,18 +1147,6 @@ async def run_folder_migration(
                             await asyncio.sleep(0)
                             return
     
-                        await event_q.put(
-                            {
-                                "type": "log",
-                                "id": file_log_id,
-                                "message": f"ファイル移行中: {rel}...",
-                                "progress": 0,
-                                "progress_download": 0,
-                                "progress_upload": 0,
-                                "level": "info",
-                            }
-                        )
-    
                         # useConverter.js の isPaperDocument と同条件 + Dropbox の export_info（Paper 専用メタ）
                         is_paper = (
                             file_name.lower().endswith(".paper")
@@ -731,6 +1156,23 @@ async def run_folder_migration(
                         base_name = (
                             file_name.rsplit(".", 1)[0] if is_paper else file_name
                         )
+                        bytes_total[0] = 0 if is_paper else int(file.get("size") or 0)
+
+                        start_ev: dict[str, Any] = {
+                            "type": "log",
+                            "id": file_log_id,
+                            "message": f"ファイル移行中: {rel}...",
+                            "progress": 0,
+                            "progress_download": 0,
+                            "progress_upload": 0,
+                            "level": "info",
+                        }
+                        if bytes_total[0] > 0:
+                            start_ev["bytes_total"] = bytes_total[0]
+                            start_ev["bytes_downloaded"] = 0
+                            start_ev["bytes_uploaded"] = 0
+                        await event_q.put(start_ev)
+                        await asyncio.sleep(0)
     
                         ex = await gdrive_file_exists(
                             client, token_ref, g_refresh, g_parent_id, base_name
@@ -870,7 +1312,7 @@ async def run_folder_migration(
                                     return
                                 u = int((sent / total) * 100)
                                 u = min(100, u)
-                                await set_ul(u)
+                                await set_ul(u, sent)
 
                             uploaded_id = await gdrive_multipart_upload(
                                 client,
@@ -927,69 +1369,159 @@ async def run_folder_migration(
                             mime = MIME_EXT.get(ext, "application/octet-stream")
                             ok = False
     
-                            if fsize > RESUMABLE_UPLOAD_THRESHOLD:
+                            if fsize > STREAMING_MIGRATION_MIN_BYTES:
                                 meta = gdrive_upload_metadata(
                                     file_name, mime, g_parent_id
                                 )
-    
-                                async def dropbox_stream_tracked():
-                                    attempt = 0
-                                    while True:
-                                        async with client.stream(
-                                            "POST",
-                                            "https://content.dropboxapi.com/2/files/download",
-                                            headers={
-                                                **dropbox_headers(
-                                                    dropbox_token_ref[0],
-                                                    True,
-                                                    dropbox_ns_id,
-                                                ),
-                                                "Dropbox-API-Arg": ascii_safe_json(
-                                                    {"path": path_lower}
-                                                ),
-                                            },
-                                        ) as resp:
-                                            if (
-                                                resp.status_code == 401
-                                                and attempt == 0
-                                                and d_refresh
-                                                and await refresh_dropbox_access_token(
-                                                    client,
-                                                    dropbox_token_ref,
-                                                    d_refresh,
-                                                )
-                                            ):
-                                                attempt += 1
-                                                continue
-                                            if resp.status_code == 401:
-                                                raise MigrationAuthError(
-                                                    "Dropbox の認証が無効です（ストリームダウンロード）。"
-                                                    " Dropbox に再接続してから再度お試しください。"
-                                                )
-                                            resp.raise_for_status()
-                                            loaded = 0
-                                            async for ch in resp.aiter_bytes():
-                                                loaded += len(ch)
-                                                if fsize > 0:
-                                                    await set_dl(
-                                                        int(loaded / fsize * 100)
-                                                    )
-                                                yield ch
-                                            return
-    
+
                                 async def upload_cb(pct: int) -> None:
-                                    await set_ul(min(100, pct))
-    
-                                ok = await gdrive_resumable_upload_stream(
-                                    client,
-                                    token_ref,
-                                    g_refresh,
-                                    meta,
-                                    fsize,
-                                    mime,
-                                    dropbox_stream_tracked(),
-                                    on_upload_progress=upload_cb,
+                                    b = (
+                                        int(fsize * min(100, pct) / 100)
+                                        if fsize > 0
+                                        else 0
+                                    )
+                                    await set_ul(min(100, pct), b)
+
+                                use_resume_ck = (
+                                    fsize >= RESUME_CHECKPOINT_MIN_BYTES
+                                    and migration_resume_checkpoints_enabled()
                                 )
+                                cp_id = (
+                                    checkpoint_id_for_file(
+                                        root_path.lower(), path_lower, fsize
+                                    )
+                                    if use_resume_ck
+                                    else None
+                                )
+                                resume_logged = [False]
+
+                                async def body_factory(resume_byte: int):
+                                    async for ch in _iter_dropbox_segmented_download(
+                                        client,
+                                        dropbox_token_ref,
+                                        d_refresh,
+                                        dropbox_ns_id,
+                                        path_lower,
+                                        fsize,
+                                        set_dl,
+                                        resume_from_byte=resume_byte,
+                                    ):
+                                        yield ch
+
+                                async def checkpoint_cb(off: int, loc: str) -> None:
+                                    if not use_resume_ck or not cp_id:
+                                        return
+                                    if (
+                                        use_resume_ck
+                                        and cp_id
+                                        and not resume_logged[0]
+                                        and off > 0
+                                    ):
+                                        resume_logged[0] = True
+                                        mb = fsize // (1024 * 1024)
+                                        await event_q.put(
+                                            {
+                                                "type": "log",
+                                                "id": file_log_id,
+                                                "message": (
+                                                    f"レジューム中: {rel} "
+                                                    f"（アップロード再開 {off // (1024 * 1024)}MB / 約{mb}MB）"
+                                                ),
+                                                "level": "info",
+                                            }
+                                        )
+                                        await asyncio.sleep(0)
+                                    await asyncio.to_thread(
+                                        save_checkpoint_atomic,
+                                        cp_id,
+                                        {
+                                            "root_path_lower": root_path.lower(),
+                                            "path_lower": path_lower,
+                                            "file_size": fsize,
+                                            "rel": rel,
+                                            "gdrive_location": loc,
+                                            "gdrive_offset": off,
+                                            "parent_id": g_parent_id,
+                                            "mime": mime,
+                                            "metadata": meta,
+                                        },
+                                    )
+
+                                ok = False
+                                round_delay = 2.0
+                                for round_num in range(RESUMABLE_FULL_PIPELINE_RETRIES):
+                                    use_resume_loc = None
+                                    if use_resume_ck and cp_id:
+                                        cp_round = load_checkpoint(cp_id)
+                                        if cp_round and (
+                                            cp_round.get("path_lower") == path_lower
+                                            and int(cp_round.get("file_size") or -1)
+                                            == fsize
+                                        ):
+                                            use_resume_loc = cp_round.get(
+                                                "gdrive_location"
+                                            )
+                                    try:
+                                        ok = await gdrive_resumable_upload_stream(
+                                            client,
+                                            token_ref,
+                                            g_refresh,
+                                            meta,
+                                            fsize,
+                                            mime,
+                                            body_factory,
+                                            on_upload_progress=upload_cb,
+                                            resume_location=use_resume_loc,
+                                            on_checkpoint=(
+                                                checkpoint_cb if use_resume_ck else None
+                                            ),
+                                        )
+                                    except ResumeSessionExpiredError:
+                                        if use_resume_ck and cp_id:
+                                            await asyncio.to_thread(
+                                                delete_checkpoint, cp_id
+                                            )
+                                        logger.warning(
+                                            "レジュームセッションが無効のためチェックポイントを破棄し再試行します rel=%s",
+                                            rel,
+                                        )
+                                        if round_num >= RESUMABLE_FULL_PIPELINE_RETRIES - 1:
+                                            ok = False
+                                            break
+                                        await asyncio.sleep(round_delay)
+                                        round_delay = min(round_delay * 2, 120.0)
+                                        continue
+                                    except MigrationAuthError:
+                                        raise
+                                    except Exception as e:
+                                        if not _is_streaming_migration_retryable(e):
+                                            raise
+                                        if round_num >= RESUMABLE_FULL_PIPELINE_RETRIES - 1:
+                                            raise
+                                        logger.warning(
+                                            "resumable ストリーム中断 (round %d/%d): %s — 再試行",
+                                            round_num + 1,
+                                            RESUMABLE_FULL_PIPELINE_RETRIES,
+                                            e,
+                                        )
+                                        await asyncio.sleep(round_delay)
+                                        round_delay = min(round_delay * 2, 120.0)
+                                        continue
+
+                                    if ok and use_resume_ck and cp_id:
+                                        await asyncio.to_thread(
+                                            delete_checkpoint, cp_id
+                                        )
+                                    if ok:
+                                        break
+                                    if round_num < RESUMABLE_FULL_PIPELINE_RETRIES - 1:
+                                        logger.warning(
+                                            "resumable upload 失敗のため再試行 (%d/%d)",
+                                            round_num + 2,
+                                            RESUMABLE_FULL_PIPELINE_RETRIES,
+                                        )
+                                        await asyncio.sleep(round_delay)
+                                        round_delay = min(round_delay * 2, 120.0)
                             else:
                                 await set_dl(5)
                                 dr = await dropbox_request_with_token_refresh(
@@ -1027,7 +1559,7 @@ async def run_folder_migration(
                                         return
                                     u = int((s / total) * 100)
                                     u = min(100, u)
-                                    await set_ul(u)
+                                    await set_ul(u, s)
     
                                 uploaded_id = await gdrive_multipart_upload(
                                     client,
@@ -1039,17 +1571,20 @@ async def run_folder_migration(
                                 )
                                 ok = bool(uploaded_id)
                             if ok:
-                                await event_q.put(
-                                    {
-                                        "type": "log",
-                                        "id": file_log_id,
-                                        "message": f"ファイル転送完了: {rel}",
-                                        "progress": 100,
-                                        "progress_download": 100,
-                                        "progress_upload": 100,
-                                        "level": "success",
-                                    }
-                                )
+                                done_ev: dict[str, Any] = {
+                                    "type": "log",
+                                    "id": file_log_id,
+                                    "message": f"ファイル転送完了: {rel}",
+                                    "progress": 100,
+                                    "progress_download": 100,
+                                    "progress_upload": 100,
+                                    "level": "success",
+                                }
+                                if fsize > 0:
+                                    done_ev["bytes_total"] = fsize
+                                    done_ev["bytes_downloaded"] = fsize
+                                    done_ev["bytes_uploaded"] = fsize
+                                await event_q.put(done_ev)
                             else:
                                 await event_q.put(
                                     {
@@ -1127,7 +1662,14 @@ async def run_folder_migration(
             runner = asyncio.create_task(run_all_files())
             try:
                 while True:
-                    ev = await event_q.get()
+                    try:
+                        ev = await asyncio.wait_for(
+                            event_q.get(),
+                            timeout=MIGRATE_STREAM_PING_INTERVAL_S,
+                        )
+                    except asyncio.TimeoutError:
+                        yield {"type": "ping", "id": mid}
+                        continue
                     if ev is None:
                         break
                     yield ev

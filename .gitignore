@@ -28,6 +28,8 @@ build/
 
 # --- Desktop ---
 desktop/logs/
+# 1GB+ レジューム用チェックポイント JSON（desktop/data/migration_resume/*.json）
+desktop/data/
 
 # --- 環境変数・秘密 ---
 # ルート・サブディレクトリの .env / .env.*（VITE_* や OAuth 用）

@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
-import { Terminal, Loader2, CheckCircle2, AlertCircle, Info, X, SkipForward } from 'lucide-react';
+import { Terminal, Loader2, CheckCircle2, AlertCircle, Info, X, SkipForward, Copy } from 'lucide-react';
+import { formatFileSize } from '../utils/formatFileSize';
 
 /** スキップ系は進捗・完了タブに混ぜない（スキップタブ専用） */
 const isSkipped = (log) => {
@@ -80,6 +81,21 @@ export const LogViewer = ({ logs = [], onClear, onClose }) => {
 
   if (logs.length === 0) return null;
 
+  /** 報告用: セッション内のエラー行だけまとめてコピー（タブに関係なく全件） */
+  const copyErrorLogsForReport = () => {
+    if (errorLogs.length === 0) return;
+    const lines = errorLogs.map((log) => {
+      const t = log.time || '--:--:--';
+      const idPart = log.id ? ` id=${log.id}` : '';
+      const m = log.message || '';
+      return `[${t}]${idPart} ${m}`;
+    });
+    const text = lines.join('\n');
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).catch(() => {});
+    }
+  };
+
   const progressCount = progressLogs.length;
   const tabs = [
     { id: 'progress', label: '進捗', count: progressCount, icon: Loader2 },
@@ -109,7 +125,7 @@ export const LogViewer = ({ logs = [], onClear, onClose }) => {
         )}
       </div>
       <div className="border-t border-slate-200 bg-slate-900 text-slate-300 flex flex-col h-48 w-full">
-      <div className="h-8 px-4 flex items-center justify-between bg-slate-800 border-b border-slate-700 shrink-0">
+      <div className="h-8 px-4 flex items-center justify-between bg-slate-800 border-b border-slate-700 shrink-0 select-none">
         <div className="flex items-center gap-2">
           <Terminal size={14} className="text-indigo-400" />
           <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">Migration Console</span>
@@ -133,6 +149,16 @@ export const LogViewer = ({ logs = [], onClear, onClose }) => {
         </div>
         <div className="flex items-center gap-2">
           <button
+            type="button"
+            disabled={errorLogs.length === 0}
+            onClick={copyErrorLogsForReport}
+            title="エラーログをすべてクリップボードへ（問い合わせ・報告用）"
+            className="flex items-center gap-1 text-[9px] font-bold text-rose-400/90 hover:text-rose-300 disabled:opacity-35 disabled:hover:text-rose-400/90 disabled:cursor-not-allowed transition-colors"
+          >
+            <Copy size={12} />
+            エラーをコピー
+          </button>
+          <button
             onClick={onClear}
             className="text-[9px] font-bold text-slate-500 hover:text-slate-300 transition-colors uppercase tracking-tighter"
           >
@@ -146,7 +172,7 @@ export const LogViewer = ({ logs = [], onClear, onClose }) => {
           </button>
         </div>
       </div>
-      <div className="flex-1 overflow-auto p-3 font-mono text-[11px] space-y-1 custom-scrollbar">
+      <div className="migration-console-log flex-1 overflow-auto p-3 font-mono text-[11px] space-y-1 custom-scrollbar cursor-text">
         {displayLogs.length === 0 ? (
           <div className="flex items-center justify-center h-full text-slate-500 text-[10px]">
             {activeTab === 'progress' && '実行中のタスクはありません'}
@@ -164,12 +190,22 @@ export const LogViewer = ({ logs = [], onClear, onClose }) => {
 
             return (
               <div key={log.id || idx} className="flex gap-3 py-0.5 border-b border-slate-800/50 last:border-0 group">
-                <span className="text-slate-600 shrink-0 select-none min-w-[52px]">[{log.time || '--:--:--'}]</span>
+                <span className="text-slate-600 shrink-0 min-w-[52px]">[{log.time || '--:--:--'}]</span>
                 <div className={`mt-0.5 ${iconColor} shrink-0`}>
                   <Icon size={12} />
                 </div>
                 <div className="flex-1 flex flex-col min-w-0">
-                  <span className={`break-all ${log.type === 'error' ? 'text-rose-300' : log.type === 'success' ? 'text-emerald-300' : skipped ? 'text-amber-300' : 'text-slate-300'}`}>
+                  <span
+                    className={`break-all ${
+                      log.type === 'error'
+                        ? 'text-rose-300'
+                        : log.type === 'success'
+                          ? 'text-emerald-300'
+                          : skipped
+                            ? 'text-amber-300'
+                            : 'text-slate-300'
+                    }`}
+                  >
                     {log.message || '処理中...'}
                   </span>
                   {log.progress !== null && log.progress !== undefined && (
@@ -200,18 +236,31 @@ export const LogViewer = ({ logs = [], onClear, onClose }) => {
                               {Math.round(log.progress_upload)}%
                             </span>
                           </div>
+                          {typeof log.bytes_total === 'number' && log.bytes_total > 0 && (
+                            <div className="text-[8px] text-slate-500 tabular-nums pl-8">
+                              DL {formatFileSize(log.bytes_downloaded ?? 0)} / {formatFileSize(log.bytes_total)} · UL{' '}
+                              {formatFileSize(log.bytes_uploaded ?? 0)} / {formatFileSize(log.bytes_total)}
+                            </div>
+                          )}
                         </>
                       ) : (
-                        <div className="flex items-center gap-2">
-                          <div className="flex-1 bg-slate-700/60 rounded-full h-[2px] overflow-hidden">
-                            <div
-                              className={`h-full rounded-full ${log.progress >= 100 ? 'bg-emerald-500' : 'bg-sky-400 shadow-[0_0_6px_rgba(56,189,248,0.6)]'}`}
-                              style={{ width: `${log.progress}%` }}
-                            />
+                        <div className="flex flex-col gap-0.5">
+                          <div className="flex items-center gap-2">
+                            <div className="flex-1 bg-slate-700/60 rounded-full h-[2px] overflow-hidden">
+                              <div
+                                className={`h-full rounded-full ${log.progress >= 100 ? 'bg-emerald-500' : 'bg-sky-400 shadow-[0_0_6px_rgba(56,189,248,0.6)]'}`}
+                                style={{ width: `${log.progress}%` }}
+                              />
+                            </div>
+                            <span className={`text-[9px] font-bold tabular-nums min-w-[28px] text-right ${log.progress >= 100 ? 'text-emerald-500' : 'text-sky-400'}`}>
+                              {Math.round(log.progress)}%
+                            </span>
                           </div>
-                          <span className={`text-[9px] font-bold tabular-nums min-w-[28px] text-right ${log.progress >= 100 ? 'text-emerald-500' : 'text-sky-400'}`}>
-                            {Math.round(log.progress)}%
-                          </span>
+                          {typeof log.bytes_total === 'number' && log.bytes_total > 0 && (
+                            <div className="text-[8px] text-slate-500 tabular-nums">
+                              {formatFileSize(Math.round((log.bytes_total * log.progress) / 100))} / {formatFileSize(log.bytes_total)}
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
