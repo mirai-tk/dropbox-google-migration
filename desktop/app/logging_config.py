@@ -10,6 +10,29 @@ from pathlib import Path
 from .config import repo_root
 
 _CONFIGURED = False
+_MEMORY_POLL_ACCESS_FILTER_ATTACHED = False
+
+
+class SuppressMemoryPollAccessLog(logging.Filter):
+    """GET /api/app/memory の 200 を uvicorn アクセスログから除外（UI の定期ポーリング用）。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if "/api/app/memory" in msg and " 200 " in msg:
+            return False
+        return True
+
+
+def attach_uvicorn_memory_poll_suppressor() -> None:
+    """
+    uvicorn は起動時にロギングを組み直すため、run_desktop で付けた Filter が効かないことがある。
+    lifespan 開始時に 1 回だけ付け直す。
+    """
+    global _MEMORY_POLL_ACCESS_FILTER_ATTACHED
+    if _MEMORY_POLL_ACCESS_FILTER_ATTACHED:
+        return
+    logging.getLogger("uvicorn.access").addFilter(SuppressMemoryPollAccessLog())
+    _MEMORY_POLL_ACCESS_FILTER_ATTACHED = True
 
 
 def _maybe_archive_previous_latest(path: Path) -> None:

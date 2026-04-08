@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import logging
 import os
 import sys
 import threading
@@ -13,16 +12,6 @@ import time
 _DESKTOP_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _DESKTOP_ROOT not in sys.path:
     sys.path.insert(0, _DESKTOP_ROOT)
-
-
-class _SuppressMemoryPollAccessLog(logging.Filter):
-    """ポーリング用 GET /api/app/memory の 200 を uvicorn アクセスログから除外する。"""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        msg = record.getMessage()
-        if "/api/app/memory" in msg and " 200 " in msg:
-            return False
-        return True
 
 
 def main() -> None:
@@ -51,7 +40,7 @@ def main() -> None:
         port=args.port,
         log_level="info",
     )
-    logging.getLogger("uvicorn.access").addFilter(_SuppressMemoryPollAccessLog())
+    # メモリ API のアクセスログ抑制は app.server の lifespan で attach（uvicorn 起動後に有効）
     server = uvicorn.Server(config)
 
     def run_server() -> None:
