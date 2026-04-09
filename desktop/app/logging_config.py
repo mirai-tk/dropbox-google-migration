@@ -17,8 +17,26 @@ class SuppressMemoryPollAccessLog(logging.Filter):
     """GET /api/app/memory の 200 を uvicorn アクセスログから除外（UI の定期ポーリング用）。"""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        msg = record.getMessage()
-        if "/api/app/memory" in msg and " 200 " in msg:
+        # uvicorn は access_logger.info('%s...%d', ..., status) 形式のため、getMessage() は
+        # `... "GET /path HTTP/1.1" 200` で終わり、画面の "200 OK" の前スペース付きとは一致しない。
+        try:
+            args = record.args
+            if (
+                args
+                and len(args) >= 5
+                and args[1] == "GET"
+                and isinstance(args[2], str)
+                and args[2].startswith("/api/app/memory")
+                and int(args[4]) == 200
+            ):
+                return False
+        except (TypeError, ValueError, AttributeError):
+            pass
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if "/api/app/memory" in msg and " 200" in msg:
             return False
         return True
 
