@@ -2,7 +2,7 @@
 
 ## 前提
 
-- Python 3.11+
+- Python 3.11+（このリポジトリでは **pyenv で 3.12.6** を使う想定の手順例があります。別バージョンでも可）
 - Node.js（UI ビルド用）
 - Google / Dropbox の OAuth クレデンシャル（`source/.env` / `desktop/.env` / **リポジトリ直下の `.env`** のいずれか。Python は未設定の変数だけ順に読み込みます）
 
@@ -10,13 +10,39 @@
 
 ```bash
 cd desktop
-python3 -m venv .venv
+# pyenv（例: 3.12.6）— 未インストールなら先に: pyenv install 3.12.6
+pyenv local 3.12.6
+python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 # PyInstaller は同じ venv で: pip install pyinstaller
 ```
 
+`pyenv` を使わない場合は、上の `pyenv local` の代わりに使いたい `python3` で `python3 -m venv .venv` としてください。
+
+リポジトリ**ルート**の `Makefile` でも同じことができます。`make help` で一覧。例: `make source-install` → `make source-build-desktop`（UI）→ `make desktop-setup` → `make desktop-run`。Apple Silicon の作り直しは `make desktop-setup-arm64`（`PYENV_VERSION` は既定 `3.12.6`、上書き可）。
+
 **fish を使う場合:** `source .venv/bin/activate` は bash 用なのでエラーになります。代わりに `source .venv/bin/activate.fish` を使うか、有効化せず `.venv/bin/pip` / `.venv/bin/python` をフルパスで実行してください。
+
+### Apple Silicon で `incompatible architecture`（pydantic_core など）
+
+`have 'arm64', need 'x86_64'` のように **CPU アーキテクチャが合わない**と、`.venv` 内の拡張モジュールが読み込めません。原因はだいたい次のどちらかです。
+
+- **`.venv` を arm64 用に `pip install` したのに、Rosetta 有効のターミナルで x86_64 の `python` を動かしている**
+- 逆に、x86_64 用 venv を arm64 の Python で動かしている
+
+**対処:** `desktop` で venv を作り直し、**CPU アーキテクチャを実行時と一致**させてください。Apple Silicon で「arm64 用に入れたパッケージ」を使うなら、**Rosetta をオフのターミナル**で動かすか、venv 作成時に明示します。
+
+```bash
+cd desktop
+rm -rf .venv
+# pyenv で 3.12.6 などを有効にしたうえで（例: pyenv local 3.12.6）、arm64 で venv 作成:
+arch -arm64 "$(pyenv which python)" -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python run_desktop.py
+```
+
+Cursor の統合ターミナルが Rosetta のときは、**ターミナルプロファイルを arm64 にする**か、上記のように **`arch -arm64` で venv を作り、起動も常に arm64 側の Python** に揃えてください。`run_desktop.py` はこの種のエラーを検出すると、標準エラーに短い手順を出します。
 
 ## UI のビルド（デスクトップ用）
 
@@ -41,7 +67,9 @@ source .venv/bin/activate          # fish なら: source .venv/bin/activate.fish
 python run_desktop.py
 ```
 
-**リポジトリルートから `python desktop/run_desktop.py` だけ叩くと、venv ではない Python が使われ `ModuleNotFoundError: keyring` などになることがあります。** 上のように `cd desktop` してから venv を有効化するか、ルートからなら `desktop/.venv/bin/python desktop/run_desktop.py` のように **venv の `python` を明示**してください。
+`desktop/.venv` を一度作って `pip install -r requirements.txt` 済みなら、`python3 run_desktop.py` のように **activate していないシステム Python** で叩いても、`run_desktop.py` が **同じ venv の Python に自動で付け替え**（`os.execv`）します。
+
+**まだ `.venv` が無い、または venv 内に keyring が入っていない**場合は従来どおりエラーになります。`cd desktop` して venv を有効化するか、ルートからなら `desktop/.venv/bin/python desktop/run_desktop.py` のように **venv の `python` を明示**してください。
 
 アプリ全体のログは既定で **`desktop/logs/app_latest.log`**（ローテーション付き）に出力されます。起動時に `_latest.log` が既にあれば、前回分を **`desktop/logs/log_YYYYMMDD_HHMMSS.log`** にリネームしてから書き込みます。より詳細な DEBUG（マイグレーション／Paper 調査用）にする場合は `python run_desktop.py --dev`、または `.env` に `PAPER_MIGRATOR_DEV=1`。パスを変えるときは環境変数 `PAPER_MIGRATOR_LOG_FILE`（`*_latest.log` で終わるパスなら同様に起動時退避します）。
 
@@ -108,7 +136,7 @@ pyinstaller paper-migrator.spec
 ログイン後、フロントが `/api/session/sync` を呼び、macOS では **キーチェーン**（`keyring`）に refresh token 等を保存します。
 
 ## ネイティブ移行エンジン
-
+ 
 `VITE_USE_NATIVE_ENGINE=true`（デスクトップビルドで既定）のとき、フォルダ一括移行は **Python** の `/api/engine/migrate`（NDJSON ストリーム）で実行されます。並列 5、約 50 ファイルごとに `gc.collect()` を実行します。
 
 ## WebView での認証確認（GSI / Dropbox PKCE）
