@@ -914,11 +914,32 @@ async def run_folder_migration(
         timeout=httpx.Timeout(connect=120.0, read=None, write=120.0, pool=120.0)
     ) as client:
         migration_aborted = False
-        try:
-            all_entries = await list_folder_recursive(
+        # 初期の再帰リスト取得は大規模フォルダで時間がかかるため、
+        # 取得中も一定間隔で ping を返して WebView 側の切断を避ける。
+        list_task = asyncio.create_task(
+            list_folder_recursive(
                 client, dropbox_token_ref, d_refresh, dropbox_ns_id, root_path
             )
+        )
+        try:
+            while True:
+                done, _pending = await asyncio.wait(
+                    {list_task},
+                    timeout=MIGRATE_STREAM_PING_INTERVAL_S,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if list_task in done:
+                    all_entries = list_task.result()
+                    break
+                if not list_task.done():
+                    yield {"type": "ping", "id": mid}
         except MigrationAuthError as e:
+            if not list_task.done():
+                list_task.cancel()
+                try:
+                    await list_task
+                except asyncio.CancelledError:
+                    pass
             yield {
                 "type": "log",
                 "message": f"移行を中断しました: {e}",
@@ -927,6 +948,12 @@ async def run_folder_migration(
             }
             return
         except Exception as e:
+            if not list_task.done():
+                list_task.cancel()
+                try:
+                    await list_task
+                except asyncio.CancelledError:
+                    pass
             yield {"type": "log", "message": f"リスト取得失敗: {e}", "level": "error"}
             return
 
