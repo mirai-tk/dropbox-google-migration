@@ -1159,6 +1159,9 @@ const App = () => {
             logs={logs}
             onClear={clearLogs}
             onClose={() => setLogs([])}
+            onStopMigration={converter.stopMigration}
+            isMigrating={converter.isGDriveProcessing}
+            isMigrationStopping={converter.isMigrationStopping}
           />
         </div>
       </main>

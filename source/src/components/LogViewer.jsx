@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { Terminal, Loader2, CheckCircle2, AlertCircle, Info, X, SkipForward, Copy } from 'lucide-react';
+import { Terminal, Loader2, CheckCircle2, AlertCircle, Info, X, SkipForward, Copy, Square } from 'lucide-react';
 import { formatFileSize } from '../utils/formatFileSize';
 
 /** スキップ系は進捗・完了タブに混ぜない（スキップタブ専用） */
@@ -55,7 +55,14 @@ const shouldShowDualTransferBars = (log) => {
   return true;
 };
 
-export const LogViewer = ({ logs = [], onClear, onClose }) => {
+export const LogViewer = ({
+  logs = [],
+  onClear,
+  onClose,
+  onStopMigration,
+  isMigrating = false,
+  isMigrationStopping = false
+}) => {
   const [activeTab, setActiveTab] = useState('progress');
 
   const { progressLogs, completedLogs, errorLogs, skippedLogs } = useMemo(() => ({
@@ -148,6 +155,18 @@ export const LogViewer = ({ logs = [], onClear, onClose }) => {
           </div>
         </div>
         <div className="flex items-center gap-2">
+          {isMigrating && (
+            <button
+              type="button"
+              onClick={onStopMigration}
+              disabled={isMigrationStopping}
+              className="flex items-center gap-1 text-[9px] font-bold text-amber-300 hover:text-amber-200 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+              title="移行停止（進行中のみ完了後に停止）"
+            >
+              {isMigrationStopping ? <Loader2 size={12} className="animate-spin" /> : <Square size={12} />}
+              {isMigrationStopping ? '停止要求中...' : '移行停止'}
+            </button>
+          )}
           <button
             type="button"
             disabled={errorLogs.length === 0}

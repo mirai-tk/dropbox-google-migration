@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { cleanMarkdown, generateDocxBlob } from '../utils/markdownParser';
 import { convertTaskMarkersToNativeChecklists } from '../utils/googleDocsChecklist';
 
@@ -109,6 +109,9 @@ export const useConverter = (
 ) => {
   const [isGDriveProcessing, setIsGDriveProcessing] = useState(false);
   const [exportingId, setExportingId] = useState(null);
+  const [isMigrationStopping, setIsMigrationStopping] = useState(false);
+  const activeMigrationIdRef = useRef(null);
+  const stopRequestedRef = useRef(false);
 
   const log = useCallback((msg, type = 'info', id = null, progress = null) => {
     if (addLog) {
@@ -854,9 +857,12 @@ export const useConverter = (
 
   const migrateFolderRecursively = useCallback(async (rootPath, rootFolderName) => {
     if (!gDriveTokenRef.current || !dbTokenRef.current) return;
+    stopRequestedRef.current = false;
+    setIsMigrationStopping(false);
 
     if (import.meta.env.VITE_USE_NATIVE_ENGINE === 'true') {
       const migrationId = `migrate-${Date.now()}`;
+      activeMigrationIdRef.current = migrationId;
       setIsGDriveProcessing(true);
       setStatus({ type: 'info', message: 'Python エンジンで移行中...' });
       try {
@@ -892,6 +898,8 @@ export const useConverter = (
         const decoder = new TextDecoder();
         let buf = '';
         let firstStreamChunk = true;
+        let sawStopped = false;
+        let sawCompleted = false;
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -913,6 +921,9 @@ export const useConverter = (
             }
             if (ev.type === 'ping') continue;
             if (ev.type === 'log' && addLog) {
+              const msg = ev.message || '';
+              if (msg.includes('停止完了')) sawStopped = true;
+              if (msg.includes('移行完了')) sawCompleted = true;
               const level = ev.level === 'error' ? 'error' : ev.level === 'success' ? 'success' : 'info';
               addLog({
                 id: ev.id,
@@ -932,7 +943,6 @@ export const useConverter = (
                 ...(typeof ev.bytes_uploaded === 'number' ? { bytes_uploaded: ev.bytes_uploaded } : {}),
               });
               const mid = ev.id && String(ev.id).startsWith('migrate-');
-              const msg = ev.message || '';
               if (mid && (msg.includes('移行進捗') || msg.includes('移行開始'))) {
                 setStatus({ type: 'info', message: msg });
               }
@@ -941,14 +951,21 @@ export const useConverter = (
             }
           }
         }
-        setStatus({ type: 'success', message: `フォルダ "${rootFolderName}" の移行が完了しました` });
-        if (fetchGDriveContents) fetchGDriveContents(selectedFolderId);
+        if (sawStopped || stopRequestedRef.current) {
+          setStatus({ type: 'info', message: `停止完了: "${rootFolderName}" の移行を終了しました` });
+        } else if (sawCompleted) {
+          setStatus({ type: 'success', message: `フォルダ "${rootFolderName}" の移行が完了しました` });
+          if (fetchGDriveContents) fetchGDriveContents(selectedFolderId);
+        }
       } catch (err) {
         console.error('[Migration native]', err);
         const { userMessage, logLine } = formatNativeStreamFatalError(err);
         setStatus({ type: 'error', message: userMessage });
         log(`致命的なエラー: ${logLine}`, 'error', 'migration-native-fatal');
       } finally {
+        activeMigrationIdRef.current = null;
+        stopRequestedRef.current = false;
+        setIsMigrationStopping(false);
         setIsGDriveProcessing(false);
       }
       return;
@@ -997,6 +1014,7 @@ export const useConverter = (
 
       let folderCount = 1;
       for (const folder of folders) {
+        if (stopRequestedRef.current) break;
         const parentPath = folder.path_lower.substring(0, folder.path_lower.lastIndexOf('/'));
         const gParentId = folderMap[parentPath] || selectedFolderId;
 
@@ -1050,6 +1068,7 @@ export const useConverter = (
       };
 
       const processFile = async (file) => {
+        if (stopRequestedRef.current) return;
         const parentPath = file.path_lower.substring(0, file.path_lower.lastIndexOf('/'));
         const gParentId = folderMap[parentPath] || selectedFolderId;
         const fileName = file.name;
@@ -1263,24 +1282,49 @@ export const useConverter = (
         asyncPool(MIGRATION_POOL_SIZE, smallFiles, processFile),
         (async () => {
           for (const f of largeFiles) {
+            if (stopRequestedRef.current) break;
             await processFile(f);
           }
         })(),
       ]);
 
-      log(`移行進捗: 移行完了 (${files.length}/${files.length})`, 'success', migrationId, 100);
-      log(`✅ 全工程が完了しました: "${rootFolderName}" の移行完了`, 'success');
-      notifyMigrationCompleteDesktop(rootFolderName);
-      setStatus({ type: 'success', message: `フォルダ "${rootFolderName}" の移行が正常に完了しました` });
-      if (fetchGDriveContents) fetchGDriveContents(selectedFolderId);
+      if (stopRequestedRef.current) {
+        log('🛑 停止完了: 進行中のみ完了して停止しました', 'info', migrationId);
+        setStatus({ type: 'info', message: `停止完了: "${rootFolderName}" の移行を終了しました` });
+      } else {
+        log(`移行進捗: 移行完了 (${files.length}/${files.length})`, 'success', migrationId, 100);
+        log(`✅ 全工程が完了しました: "${rootFolderName}" の移行完了`, 'success');
+        notifyMigrationCompleteDesktop(rootFolderName);
+        setStatus({ type: 'success', message: `フォルダ "${rootFolderName}" の移行が正常に完了しました` });
+        if (fetchGDriveContents) fetchGDriveContents(selectedFolderId);
+      }
     } catch (err) {
       console.error('Recursive migration failed:', err);
       log(`致命的なエラーが発生しました: ${err.message}`, 'error');
       setStatus({ type: 'error', message: `移行失敗: ${err.message}` });
     } finally {
+      stopRequestedRef.current = false;
+      setIsMigrationStopping(false);
       setIsGDriveProcessing(false);
     }
   }, [gDriveTokenRef, dbTokenRef, selectedFolderId, listFolderRecursive, getApiHeaders, asciiSafeJson, setStatus, fetchGDriveContents, dFetch, gFetch, createGDriveFolderSilent, rootNamespaceId, addLog, log]);
+
+  const stopMigration = useCallback(async () => {
+    if (!isGDriveProcessing || stopRequestedRef.current) return;
+    stopRequestedRef.current = true;
+    setIsMigrationStopping(true);
+    const migrationId = activeMigrationIdRef.current;
+    if (import.meta.env.VITE_USE_NATIVE_ENGINE === 'true' && migrationId) {
+      try {
+        await fetch(`/api/engine/migrate/${encodeURIComponent(migrationId)}/stop`, { method: 'POST' });
+        log('停止要求を送信しました（進行中のみ完了後に停止します）', 'info', migrationId);
+      } catch (e) {
+        log(`停止要求の送信に失敗: ${e?.message || e}`, 'error', migrationId);
+      }
+    } else {
+      log('停止要求を受け付けました（進行中のみ完了後に停止します）', 'info');
+    }
+  }, [isGDriveProcessing, log]);
 
   const bulkSaveToGoogleDocs = useCallback(async (selectedFileIds, folderFiles) => {
     if (selectedFileIds.length === 0 || !gDriveTokenRef.current) return;
@@ -1446,6 +1490,8 @@ export const useConverter = (
     saveToGoogleDocs,
     bulkSaveToGoogleDocs,
     migrateFolderRecursively,
+    stopMigration,
+    isMigrationStopping,
     downloadFile
   };
 };

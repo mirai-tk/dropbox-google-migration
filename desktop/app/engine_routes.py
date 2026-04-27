@@ -8,7 +8,11 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from .engine.migrate import gdrive_resumable_cancel, run_folder_migration
+from .engine.migrate import (
+    gdrive_resumable_cancel,
+    request_migration_stop,
+    run_folder_migration,
+)
 from .engine.resume_checkpoint import (
     delete_checkpoint,
     list_checkpoints_metadata,
@@ -63,6 +67,18 @@ async def migrate_folder(body: MigrateBody):
             yield (json.dumps(err_ev, ensure_ascii=False) + "\n").encode("utf-8")
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+
+@router.post("/migrate/{migration_id}/stop")
+async def stop_migration(migration_id: str):
+    accepted = request_migration_stop(migration_id)
+    if not accepted:
+        return {
+            "ok": False,
+            "accepted": False,
+            "message": "指定された migration_id は実行中ではありません",
+        }
+    return {"ok": True, "accepted": True}
 
 
 class ResumeCancelBody(BaseModel):

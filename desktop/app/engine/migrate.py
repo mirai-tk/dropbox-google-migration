@@ -34,6 +34,8 @@ from .resume_checkpoint import (
 
 logger = logging.getLogger(__name__)
 
+_MIGRATION_STOP_FLAGS: dict[str, asyncio.Event] = {}
+
 # 軽いファイルの同時処理数（大容量は large_sem で 1 件ずつ）
 MIGRATION_POOL_SIZE = 5
 # これを超える通常ファイルは Dropbox ストリーム → GDrive resumable（フルバッファを避ける）
@@ -57,6 +59,24 @@ def _resumable_chunk_size_for_file(file_size: int) -> int:
     if file_size >= _RESUMABLE_BOUND_16:
         return RESUMABLE_CHUNK_TIER_16_50
     return RESUMABLE_CHUNK_TIER_LT16
+
+
+def register_migration_stop_flag(migration_id: str) -> asyncio.Event:
+    ev = asyncio.Event()
+    _MIGRATION_STOP_FLAGS[migration_id] = ev
+    return ev
+
+
+def request_migration_stop(migration_id: str) -> bool:
+    ev = _MIGRATION_STOP_FLAGS.get(migration_id)
+    if ev is None:
+        return False
+    ev.set()
+    return True
+
+
+def unregister_migration_stop_flag(migration_id: str) -> None:
+    _MIGRATION_STOP_FLAGS.pop(migration_id, None)
 RESUMABLE_CHUNK_PUT_MAX_ATTEMPTS = 8
 RESUMABLE_CHUNK_PUT_TIMEOUT = 600.0
 # Google が返す一時障害（503 transientError 等）・レート制限
@@ -933,6 +953,7 @@ async def run_folder_migration(
     dropbox_token_ref: list[str] = [dropbox_token]
     d_refresh = dropbox_refresh_token
     mid = migration_id or "migrate-py"
+    stop_event = register_migration_stop_flag(mid)
     yield {
         "type": "log",
         "id": mid,
@@ -958,6 +979,14 @@ async def run_folder_migration(
         )
         try:
             while True:
+                if stop_event.is_set():
+                    yield {
+                        "type": "log",
+                        "id": mid,
+                        "message": "停止要求を受け付けました。現在進行中の処理のみ完了後に停止します。",
+                        "level": "info",
+                    }
+                    return
                 done, _pending = await asyncio.wait(
                     {list_task},
                     timeout=MIGRATE_STREAM_PING_INTERVAL_S,
@@ -1062,6 +1091,14 @@ async def run_folder_migration(
     
             folder_count = 1
             for folder in folders:
+                if stop_event.is_set():
+                    yield {
+                        "type": "log",
+                        "id": mid,
+                        "message": "停止要求を受け付けました。現在進行中の処理のみ完了後に停止します。",
+                        "level": "info",
+                    }
+                    break
                 parent_path = folder["path_lower"][: folder["path_lower"].rindex("/")]
                 g_parent_id = folder_map.get(parent_path, selected_folder_id)
                 if g_parent_id not in gdrive_children_cache:
@@ -1116,6 +1153,7 @@ async def run_folder_migration(
 
             async def process_file(file: dict) -> None:
                 nonlocal completed
+                counted = False
                 path_lower = file["path_lower"]
                 file_name = file["name"]
                 parent_path = path_lower[: path_lower.rindex("/")]
@@ -1192,6 +1230,9 @@ async def run_folder_migration(
                 )
 
                 async with (large_sem if use_serial_large else sem):
+                    if stop_event.is_set():
+                        return
+                    counted = True
                     try:
                         n_files = len(files)
     
@@ -1670,28 +1711,29 @@ async def run_folder_migration(
                             }
                         )
                     finally:
-                        async with lock:
-                            completed += 1
-                            n = len(files)
-                            if n > 0:
-                                should_report = (
-                                    completed == 1
-                                    or completed == n
-                                    or completed % MIGRATION_POOL_SIZE == 0
-                                )
-                                if should_report:
-                                    fp = 30 + round((completed / n) * 70)
-                                    await event_q.put(
-                                        {
-                                            "type": "log",
-                                            "id": mid,
-                                            "message": f"移行進捗: ファイル移行中 ({completed}/{n})",
-                                            "progress": min(100, fp),
-                                            "level": "info",
-                                        }
+                        if counted:
+                            async with lock:
+                                completed += 1
+                                n = len(files)
+                                if n > 0:
+                                    should_report = (
+                                        completed == 1
+                                        or completed == n
+                                        or completed % MIGRATION_POOL_SIZE == 0
                                     )
-                            if completed % CHECKPOINT_EVERY == 0:
-                                gc.collect()
+                                    if should_report:
+                                        fp = 30 + round((completed / n) * 70)
+                                        await event_q.put(
+                                            {
+                                                "type": "log",
+                                                "id": mid,
+                                                "message": f"移行進捗: ファイル移行中 ({completed}/{n})",
+                                                "progress": min(100, fp),
+                                                "level": "info",
+                                            }
+                                        )
+                                if completed % CHECKPOINT_EVERY == 0:
+                                    gc.collect()
 
             async def run_all_files() -> None:
                 nonlocal migration_aborted
@@ -1718,6 +1760,18 @@ async def run_folder_migration(
                             "type": "log",
                             "message": f"移行を中断しました: {first_auth}",
                             "level": "error",
+                            "id": mid,
+                        }
+                    )
+                elif stop_event.is_set():
+                    await event_q.put(
+                        {
+                            "type": "log",
+                            "message": (
+                                f"🛑 停止完了: 進行中のみ完了して停止しました "
+                                f"({completed}/{len(files)})"
+                            ),
+                            "level": "info",
                             "id": mid,
                         }
                     )
@@ -1759,7 +1813,7 @@ async def run_folder_migration(
             }
             return
 
-        if not migration_aborted:
+        if not migration_aborted and not stop_event.is_set():
             await asyncio.to_thread(
                 show_desktop_notification,
                 "Dropbox → Google Drive",
@@ -1772,3 +1826,4 @@ async def run_folder_migration(
                 "id": mid,
                 "progress": 100,
             }
+    unregister_migration_stop_flag(mid)
