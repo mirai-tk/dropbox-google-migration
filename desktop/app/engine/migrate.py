@@ -120,6 +120,23 @@ def ascii_safe_json(obj: dict) -> str:
     return json.dumps(obj, ensure_ascii=True)
 
 
+def _dropbox_relative_under_root_display(root_path: str, entry: dict[str, Any]) -> str:
+    """ログ表示用: root 配下の相対パスを path_display の大文字小文字のまま返す。"""
+    pl = (entry.get("path_lower") or "").rstrip("/")
+    pd = (entry.get("path_display") or pl or "").rstrip("/")
+    name = str(entry.get("name") or "")
+    rp = (root_path or "").rstrip("/").lower()
+    pl_lc = pl.lower()
+    if rp and not pl_lc.startswith(rp):
+        return name
+    rp_parts = [p for p in rp.split("/") if p]
+    depth = len(rp_parts)
+    pd_parts = [p for p in pd.split("/") if p]
+    if len(pd_parts) > depth:
+        return "/".join(pd_parts[depth:])
+    return name
+
+
 def gdrive_upload_metadata(name: str, mime_type: str, parent_id: str) -> dict[str, Any]:
     """files.create 用。ルート（マイドライブ直下）のときは parents を省略する。
 
@@ -576,20 +593,38 @@ async def gdrive_multipart_upload(
     for attempt in range(GDRIVE_MULTIPART_UPLOAD_RETRIES):
         if on_body_progress:
             await on_body_progress(0, total)
-        r = await google_request_with_token_refresh(
-            client,
-            token_ref,
-            refresh,
-            lambda tok: client.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {tok}",
-                    "Content-Type": f"multipart/related; boundary={boundary}",
-                },
-                content=stream_body(),
-                timeout=600.0,
-            ),
-        )
+        try:
+            r = await google_request_with_token_refresh(
+                client,
+                token_ref,
+                refresh,
+                lambda tok: client.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {tok}",
+                        "Content-Type": f"multipart/related; boundary={boundary}",
+                    },
+                    content=stream_body(),
+                    # AsyncClient 側の read=None を尊重（大きい multipart で待ちが長くても切らない）
+                ),
+            )
+        except httpx.TransportError as e:
+            if attempt >= GDRIVE_MULTIPART_UPLOAD_RETRIES - 1:
+                logger.error(
+                    "gdrive_multipart_upload transport failed after retries: %s",
+                    e,
+                    exc_info=True,
+                )
+                return None
+            logger.warning(
+                "gdrive_multipart_upload transport error, retry %d/%d: %s",
+                attempt + 1,
+                GDRIVE_MULTIPART_UPLOAD_RETRIES,
+                e,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60.0)
+            continue
         if r.is_success:
             break
         if not _gdrive_http_is_transient(r.status_code) or attempt >= GDRIVE_MULTIPART_UPLOAD_RETRIES - 1:
@@ -1087,7 +1122,7 @@ async def run_folder_migration(
                 g_parent_id = folder_map.get(parent_path, selected_folder_id)
                 file_log_id = f"file-{path_lower}"
                 rel = root_folder_name + "/" + (
-                    path_lower[len(root_path) :].lstrip("/") or file_name
+                    _dropbox_relative_under_root_display(root_path, file) or file_name
                 )
     
                 # Dropbox→GDrive は DL/UL を別スケールで保持し、合成 progress=(dl+ul)/2（上書きで 50% 固定に見えるのを防ぐ）
@@ -1639,16 +1674,22 @@ async def run_folder_migration(
                             completed += 1
                             n = len(files)
                             if n > 0:
-                                fp = 30 + round((completed / n) * 70)
-                                await event_q.put(
-                                    {
-                                        "type": "log",
-                                        "id": mid,
-                                        "message": f"移行進捗: ファイル移行中 ({completed}/{n})",
-                                        "progress": min(100, fp),
-                                        "level": "info",
-                                    }
+                                should_report = (
+                                    completed == 1
+                                    or completed == n
+                                    or completed % MIGRATION_POOL_SIZE == 0
                                 )
+                                if should_report:
+                                    fp = 30 + round((completed / n) * 70)
+                                    await event_q.put(
+                                        {
+                                            "type": "log",
+                                            "id": mid,
+                                            "message": f"移行進捗: ファイル移行中 ({completed}/{n})",
+                                            "progress": min(100, fp),
+                                            "level": "info",
+                                        }
+                                    )
                             if completed % CHECKPOINT_EVERY == 0:
                                 gc.collect()
 

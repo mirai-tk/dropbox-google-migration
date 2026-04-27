@@ -34,6 +34,21 @@ const asyncPool = async (poolLimit, array, iteratorFn) => {
   return Promise.all(ret);
 };
 
+/** ログ表示: root 配下の相対パスを path_display のまま返す（path_lower の全面小文字を避ける） */
+function dropboxRelativePathForLog(rootPath, entry) {
+  const pl = (entry.path_lower || '').replace(/\/+$/, '');
+  const pd = (entry.path_display || pl || '').replace(/\/+$/, '');
+  const name = entry.name || '';
+  const rp = (rootPath || '').replace(/\/+$/, '').toLowerCase();
+  const plLc = pl.toLowerCase();
+  if (rp && !plLc.startsWith(rp)) return name;
+  const rpParts = rp.split('/').filter(Boolean);
+  const depth = rpParts.length;
+  const pdParts = pd.split('/').filter(Boolean);
+  if (pdParts.length > depth) return pdParts.slice(depth).join('/');
+  return name;
+}
+
 /** WebKit/pywebview で fetch/ストリーム失敗時に message が "Load failed" だけになることがある */
 function formatNativeStreamFatalError(err) {
   const raw = err?.message != null ? String(err.message) : String(err);
@@ -1024,6 +1039,11 @@ export const useConverter = (
       const bumpFilePhaseProgress = () => {
         if (files.length === 0) return;
         fileCount++;
+        const shouldReport =
+          fileCount === 1 ||
+          fileCount === files.length ||
+          fileCount % MIGRATION_POOL_SIZE === 0;
+        if (!shouldReport) return;
         const fp = 30 + Math.round((fileCount / files.length) * 70);
         log(`移行進捗: ファイル移行中 (${fileCount}/${files.length})`, 'info', migrationId, fp);
         setStatus({ type: 'info', message: `ファイルを移行中... (${fileCount}/${files.length})` });
@@ -1034,7 +1054,7 @@ export const useConverter = (
         const gParentId = folderMap[parentPath] || selectedFolderId;
         const fileName = file.name;
         if (fileName.toLowerCase().endsWith('.web')) {
-          const gDrivePathSkip = rootFolderName + '/' + (file.path_lower.substring(rootPath.length).replace(/^\//, '') || fileName);
+          const gDrivePathSkip = rootFolderName + '/' + (dropboxRelativePathForLog(rootPath, file) || fileName);
           const webSkipLogId = `file-${file.path_lower}`;
           log(`スキップ（.web・Dropbox Web 形式は非対応）: ${gDrivePathSkip}`, 'info', webSkipLogId, 100);
           bumpFilePhaseProgress();
@@ -1046,7 +1066,7 @@ export const useConverter = (
         const existing = await gDriveFileExists(gParentId, baseFileName);
         const fileLogId = `file-${file.path_lower}`;
         if (existing) {
-          const gDrivePathSkip = rootFolderName + '/' + (file.path_lower.substring(rootPath.length).replace(/^\//, '') || fileName);
+          const gDrivePathSkip = rootFolderName + '/' + (dropboxRelativePathForLog(rootPath, file) || fileName);
           if (isPaperDocument) {
             log(`スキップ（既存・同一）: ${gDrivePathSkip}`, 'info', fileLogId, 100);
             bumpFilePhaseProgress();
@@ -1060,18 +1080,18 @@ export const useConverter = (
             bumpFilePhaseProgress();
             return;
           }
-          const gDrivePathOver = rootFolderName + '/' + (file.path_lower.substring(rootPath.length).replace(/^\//, '') || fileName);
+          const gDrivePathOver = rootFolderName + '/' + (dropboxRelativePathForLog(rootPath, file) || fileName);
           log(`上書き（容量が異なる）: ${gDrivePathOver}`, 'info');
           const deleted = await gDriveDeleteFile(existing.id);
           if (!deleted) {
-            const gDrivePathDel = rootFolderName + '/' + (file.path_lower.substring(rootPath.length).replace(/^\//, '') || fileName);
+            const gDrivePathDel = rootFolderName + '/' + (dropboxRelativePathForLog(rootPath, file) || fileName);
             log(`削除失敗のためスキップ: ${gDrivePathDel}`, 'error', fileLogId, 100);
             bumpFilePhaseProgress();
             return;
           }
         }
 
-        const gDrivePathProgress = rootFolderName + '/' + (file.path_lower.substring(rootPath.length).replace(/^\//, '') || fileName);
+        const gDrivePathProgress = rootFolderName + '/' + (dropboxRelativePathForLog(rootPath, file) || fileName);
         log(`ファイル移行中: ${gDrivePathProgress}...`, 'info', fileLogId, 0);
         try {
           if (isPaperDocument) {
@@ -1121,11 +1141,11 @@ export const useConverter = (
                   console.warn('[GDoc] チェックリスト API 後処理:', e?.message || e);
                 }
               }
-              const gDrivePath = rootFolderName + '/' + (file.path_lower.substring(rootPath.length).replace(/^\//, '') || baseFileName);
+              const gDrivePath = rootFolderName + '/' + (dropboxRelativePathForLog(rootPath, file) || baseFileName);
               log(`Paper変換完了: ${gDrivePath}`, 'success', fileLogId, 100);
               markdownText = textToSave = docxBlob = form = null;
             } else {
-              const gDrivePathFail = rootFolderName + '/' + (file.path_lower.substring(rootPath.length).replace(/^\//, '') || baseFileName);
+              const gDrivePathFail = rootFolderName + '/' + (dropboxRelativePathForLog(rootPath, file) || baseFileName);
               log(`Paperエクスポート失敗: ${gDrivePathFail}`, 'error', fileLogId, 100);
             }
           } else {
@@ -1175,10 +1195,10 @@ export const useConverter = (
                 [50, 100]
               );
               if (response.ok) {
-                const gDrivePath = rootFolderName + '/' + (file.path_lower.substring(rootPath.length).replace(/^\//, '') || fileName);
+                const gDrivePath = rootFolderName + '/' + (dropboxRelativePathForLog(rootPath, file) || fileName);
                 log(`ファイル転送完了（分割送信）: ${gDrivePath}`, 'success', fileLogId, 100);
               } else {
-                const gDrivePathFail = rootFolderName + '/' + (file.path_lower.substring(rootPath.length).replace(/^\//, '') || fileName);
+                const gDrivePathFail = rootFolderName + '/' + (dropboxRelativePathForLog(rootPath, file) || fileName);
                 log(`ファイル転送失敗: ${gDrivePathFail}`, 'error', fileLogId, 100);
               }
             } else {
@@ -1210,11 +1230,11 @@ export const useConverter = (
                   form, null, fileLogId, [50, 100], fileBlob.size || file.size || 0,
                   { metadata: { name: fileName, mimeType, parents: gParentId !== 'root' ? [gParentId] : [] }, fileBlob, filename: fileName }
                 );
-                const gDrivePath = rootFolderName + '/' + (file.path_lower.substring(rootPath.length).replace(/^\//, '') || fileName);
+                const gDrivePath = rootFolderName + '/' + (dropboxRelativePathForLog(rootPath, file) || fileName);
                 log(`ファイル転送完了: ${gDrivePath}`, 'success', fileLogId, 100);
                 fileBlob = form = null;
               } else {
-                const gDrivePathFail = rootFolderName + '/' + (file.path_lower.substring(rootPath.length).replace(/^\//, '') || fileName);
+                const gDrivePathFail = rootFolderName + '/' + (dropboxRelativePathForLog(rootPath, file) || fileName);
                 log(`ファイルダウンロード失敗: ${gDrivePathFail}`, 'error', fileLogId, 100);
               }
             }
@@ -1225,7 +1245,7 @@ export const useConverter = (
           const errMsg = isMemoryOrFetch
             ? `メモリ不足の可能性があります（ストレージの空き容量を確認してください）`
             : fileErr.message;
-          const gDrivePathErr = rootFolderName + '/' + (file.path_lower.substring(rootPath.length).replace(/^\//, '') || fileName);
+          const gDrivePathErr = rootFolderName + '/' + (dropboxRelativePathForLog(rootPath, file) || fileName);
           log(`ファイル移行エラー: ${gDrivePathErr} - ${errMsg}`, 'error', fileLogId, 100);
         }
         bumpFilePhaseProgress();
