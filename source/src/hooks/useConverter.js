@@ -1053,15 +1053,18 @@ export const useConverter = (
       log(`移行進捗: ファイル移行中 (0/${files.length})`, 'info', migrationId, 30);
 
       let fileCount = 0;
+      /** 直近に全体 (x/n) を出した完了件数（毎件ログしないためのまとめ幅＝プールと同じ） */
+      let lastReportedFileCount = 0;
       /** ファイル1件あたりの処理（DL+UL 含む）が終わったタイミングで全体進捗を更新（開始数ベースだと並列で先に100%になる） */
       const bumpFilePhaseProgress = () => {
         if (files.length === 0) return;
         fileCount++;
+        const stride = MIGRATION_POOL_SIZE;
+        const nextThreshold = lastReportedFileCount + stride;
         const shouldReport =
-          fileCount === 1 ||
-          fileCount === files.length ||
-          fileCount % MIGRATION_POOL_SIZE === 0;
+          fileCount === files.length || fileCount >= nextThreshold;
         if (!shouldReport) return;
+        lastReportedFileCount = fileCount;
         const fp = 30 + Math.round((fileCount / files.length) * 70);
         log(`移行進捗: ファイル移行中 (${fileCount}/${files.length})`, 'info', migrationId, fp);
         setStatus({ type: 'info', message: `ファイルを移行中... (${fileCount}/${files.length})` });
