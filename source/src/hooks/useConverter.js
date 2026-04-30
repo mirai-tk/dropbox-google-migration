@@ -2,10 +2,13 @@ import { useState, useCallback, useRef } from 'react';
 import { cleanMarkdown, generateDocxBlob } from '../utils/markdownParser';
 import { convertTaskMarkersToNativeChecklists } from '../utils/googleDocsChecklist';
 
-// 軽量ファイルの同時処理数（80MB 超は直列・ネイティブエンジンと揃える）
+// 軽量ファイルの同時処理数（1GB 以下の resumable もここに含めて並列化）
 const MIGRATION_POOL_SIZE = 5;
-/** これを超える通常ファイルは Dropbox ストリーム → GDrive resumable。かつこの閾値超は同時1件のみ。 */
+/** これを超える通常ファイルは Dropbox ストリーム → GDrive resumable。 */
 const STREAMING_MIGRATION_MIN_BYTES = 80 * 1024 * 1024;
+/** 1GB 超の通常ファイルは専用レーンで最大 2 件まで並列。 */
+const SERIAL_MIGRATION_MIN_BYTES = 1 * 1024 * 1024 * 1024;
+const SERIAL_MIGRATION_POOL_SIZE = 2;
 const RESUMABLE_CHUNK_SIZE = 256 * 1024;
 
 /** ファイルサイズが分かるときの DL/UL バイト表示用（％から近似） */
@@ -1278,17 +1281,15 @@ export const useConverter = (
       for (const f of files) {
         const sz = f.size != null ? parseInt(String(f.size), 10) : 0;
         const isWeb = f.name && f.name.toLowerCase().endsWith('.web');
-        if (!isWeb && sz > STREAMING_MIGRATION_MIN_BYTES) largeFiles.push(f);
+        if (!isWeb && sz > SERIAL_MIGRATION_MIN_BYTES) largeFiles.push(f);
         else smallFiles.push(f);
       }
       await Promise.all([
         asyncPool(MIGRATION_POOL_SIZE, smallFiles, processFile),
-        (async () => {
-          for (const f of largeFiles) {
-            if (stopRequestedRef.current) break;
-            await processFile(f);
-          }
-        })(),
+        asyncPool(SERIAL_MIGRATION_POOL_SIZE, largeFiles, async (f) => {
+          if (stopRequestedRef.current) return;
+          await processFile(f);
+        }),
       ]);
 
       if (stopRequestedRef.current) {
@@ -1413,16 +1414,12 @@ export const useConverter = (
         const file = folderFiles.find((ff) => ff.path_lower === path);
         const sz = file && file.size != null ? parseInt(String(file.size), 10) : 0;
         const isWeb = file?.name && file.name.toLowerCase().endsWith('.web');
-        if (file && !isWeb && sz > STREAMING_MIGRATION_MIN_BYTES) largeIds.push(path);
+        if (file && !isWeb && sz > SERIAL_MIGRATION_MIN_BYTES) largeIds.push(path);
         else smallIds.push(path);
       }
       await Promise.all([
         asyncPool(MIGRATION_POOL_SIZE, smallIds, processBulkFile),
-        (async () => {
-          for (const path of largeIds) {
-            await processBulkFile(path);
-          }
-        })(),
+        asyncPool(SERIAL_MIGRATION_POOL_SIZE, largeIds, processBulkFile),
       ]);
       setStatus({ type: 'success', message: `${successCount} 個のファイルの変換と保存が完了しました。` });
       log(`一括変換完了: ${successCount}/${selectedFileIds.length} 成功`, 'success', bulkId, 100);

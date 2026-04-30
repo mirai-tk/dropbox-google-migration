@@ -36,11 +36,13 @@ logger = logging.getLogger(__name__)
 
 _MIGRATION_STOP_FLAGS: dict[str, asyncio.Event] = {}
 
-# 軽いファイルの同時処理数（大容量は large_sem で 1 件ずつ）
+# 軽いファイルの同時処理数（1GB 以下の resumable もここに含めて並列化）
 MIGRATION_POOL_SIZE = 5
 # これを超える通常ファイルは Dropbox ストリーム → GDrive resumable（フルバッファを避ける）
-# かつこの閾値超は並列プールではなく直列（他と重ならない）
 STREAMING_MIGRATION_MIN_BYTES = 80 * 1024 * 1024
+# 1GB 超の通常ファイルは専用レーンで最大 2 件まで並列
+SERIAL_MIGRATION_MIN_BYTES = 1 * 1024 * 1024 * 1024
+SERIAL_MIGRATION_POOL_SIZE = 2
 # Google resumable は 256KiB 以上の倍数。ファイルサイズ帯でチャンクを変える（PUT 回数とメモリのバランス）
 RESUMABLE_CHUNK_TIER_LT16 = 256 * 1024  # 16MB 未満
 RESUMABLE_CHUNK_TIER_16_50 = 8 * 1024 * 1024  # 16MB 以上 50MB 未満
@@ -1149,7 +1151,7 @@ async def run_folder_migration(
             }
     
             sem = asyncio.Semaphore(MIGRATION_POOL_SIZE)
-            large_sem = asyncio.Semaphore(1)
+            large_sem = asyncio.Semaphore(SERIAL_MIGRATION_POOL_SIZE)
             # 全体進捗 (x/n) はプール幅ごとにまとめて出す（毎件だとログ・トーストが多すぎる）
             last_reported_file_completed = [0]
 
@@ -1228,7 +1230,7 @@ async def run_folder_migration(
                 raw_size = int(file.get("size") or 0)
                 use_serial_large = (
                     not file_name.lower().endswith(".web")
-                    and raw_size > STREAMING_MIGRATION_MIN_BYTES
+                    and raw_size > SERIAL_MIGRATION_MIN_BYTES
                 )
 
                 async with (large_sem if use_serial_large else sem):
