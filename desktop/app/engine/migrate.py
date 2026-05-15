@@ -1152,8 +1152,6 @@ async def run_folder_migration(
     
             sem = asyncio.Semaphore(MIGRATION_POOL_SIZE)
             large_sem = asyncio.Semaphore(SERIAL_MIGRATION_POOL_SIZE)
-            # 全体進捗 (x/n) はプール幅ごとにまとめて出す（毎件だとログ・トーストが多すぎる）
-            last_reported_file_completed = [0]
 
             async def process_file(file: dict) -> None:
                 nonlocal completed
@@ -1721,23 +1719,14 @@ async def run_folder_migration(
                                 completed += 1
                                 n = len(files)
                                 if n > 0:
-                                    stride = MIGRATION_POOL_SIZE
-                                    next_threshold = (
-                                        last_reported_file_completed[0] + stride
-                                    )
-                                    should_report = completed == n or (
-                                        completed >= next_threshold
-                                    )
-                                    if should_report:
-                                        last_reported_file_completed[0] = completed
-                                        fp = 30 + round((completed / n) * 70)
-                                        ev_overall = {
-                                            "type": "log",
-                                            "id": mid,
-                                            "message": f"移行進捗: ファイル移行中 ({completed}/{n})",
-                                            "progress": min(100, fp),
-                                            "level": "info",
-                                        }
+                                    fp = 30 + round((completed / n) * 70)
+                                    ev_overall = {
+                                        "type": "log",
+                                        "id": mid,
+                                        "message": f"移行進捗: ファイル移行中 ({completed}/{n})",
+                                        "progress": min(100, fp),
+                                        "level": "info",
+                                    }
                                 if completed % CHECKPOINT_EVERY == 0:
                                     gc.collect()
                             if ev_overall is not None:

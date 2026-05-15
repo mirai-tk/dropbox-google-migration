@@ -91,12 +91,13 @@ export const LogViewer = ({
   /** 報告用: セッション内のエラー行だけまとめてコピー（タブに関係なく全件） */
   const copyErrorLogsForReport = () => {
     if (errorLogs.length === 0) return;
-    const lines = errorLogs.map((log) => {
-      const t = log.time || '--:--:--';
-      const idPart = log.id ? ` id=${log.id}` : '';
-      const m = log.message || '';
-      return `[${t}]${idPart} ${m}`;
-    });
+      const lines = errorLogs.map((log) => {
+        const t = log.time || '--:--:--';
+        const idPart = log.id ? ` id=${log.id}` : '';
+        const m = log.message || '';
+        const d = log.detail ? ` | ${log.detail}` : '';
+        return `[${t}]${idPart} ${m}${d}`;
+      });
     const text = lines.join('\n');
     if (navigator.clipboard?.writeText) {
       navigator.clipboard.writeText(text).catch(() => {});
@@ -227,6 +228,11 @@ export const LogViewer = ({
                   >
                     {log.message || '処理中...'}
                   </span>
+                  {log.detail ? (
+                    <span className="text-[9px] text-slate-500 break-all leading-snug mt-0.5 border-l border-slate-600/80 pl-1.5">
+                      {log.detail}
+                    </span>
+                  ) : null}
                   {log.progress !== null && log.progress !== undefined && (
                     <div className="mt-1 flex flex-col gap-1">
                       {shouldShowDualTransferBars(log) ? (

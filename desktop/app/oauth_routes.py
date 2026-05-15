@@ -130,8 +130,14 @@ async def dropbox_refresh(body: DropboxRefreshBody):
 async def proxy_image(url: str):
     if not url.startswith("http://") and not url.startswith("https://"):
         raise HTTPException(400, "Invalid URL")
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Image fetch failed (network or DNS error)",
+        ) from exc
     if not r.is_success:
         raise HTTPException(r.status_code)
     from fastapi.responses import Response

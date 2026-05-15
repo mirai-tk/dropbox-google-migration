@@ -311,7 +311,7 @@ export const useConverter = (
       try {
         return await gUploadWithFetchStream(url, streamOpts.metadata, streamOpts.fileBlob, streamOpts.filename, logId, progressRange);
       } catch (err) {
-        if (addLog) addLog({ id: logId, message: 'Streams API失敗、FormDataで再試行...' });
+        if (addLog) addLog({ id: logId, detail: 'Streams API失敗、FormDataで再試行...' });
       }
     }
     return gUploadWithFetch(url, body, contentType, logId, progressRange);
@@ -419,7 +419,7 @@ export const useConverter = (
         });
       }
     };
-    if (addLog) addLog({ id: logId, message: '分割送信でアップロード中...' });
+    if (addLog) addLog({ id: logId, detail: '分割送信でアップロード中...' });
     console.log('[Resumable] 開始: ファイルサイズ=', fileSize, 'bytes, チャンク=', RESUMABLE_CHUNK_SIZE);
     const res = await dFetch(dropboxUrl, dropboxOptions);
     if (!res.ok) return { ok: false, status: res.status };
@@ -579,7 +579,7 @@ export const useConverter = (
         try {
           result = await dFetchWithProgressStream(url, options, onProgress);
         } catch (streamErr) {
-          if (addLog) addLog({ id: options._logId, message: 'Streams API失敗、fetchで再試行...' });
+          if (addLog) addLog({ id: options._logId, detail: 'Streams API失敗、fetchで再試行...' });
           result = await tryFetch();
         }
         if (result.ok) return result;
@@ -593,7 +593,7 @@ export const useConverter = (
         lastError = err;
         if (attempt < DROPBOX_DOWNLOAD_MAX_RETRIES - 1) {
           const delayMs = Math.min(2000 * Math.pow(2, attempt), 30000);
-          if (addLog) addLog({ id: options._logId, message: `リトライ ${attempt + 2}/${DROPBOX_DOWNLOAD_MAX_RETRIES} (${delayMs / 1000}秒後)...` });
+          if (addLog) addLog({ id: options._logId, detail: `リトライ ${attempt + 2}/${DROPBOX_DOWNLOAD_MAX_RETRIES} (${delayMs / 1000}秒後)...` });
           await new Promise((r) => setTimeout(r, delayMs));
         } else {
           throw lastError;
@@ -748,7 +748,7 @@ export const useConverter = (
       setCurrentFilePath(targetPath);
       setActiveTab('editor');
       setStatus({ type: 'success', message: 'Paperドキュメントの取得に成功しました' });
-      log(`変換完了: ${targetPath}`, 'success', exportId, 100);
+      log(`Paper取得完了（エディタで確認し、保存で Google ドキュメント化）: ${targetPath}`, 'success', exportId, 100);
 
     } catch (err) {
       setStatus({ type: 'error', message: err.message });
@@ -1056,18 +1056,10 @@ export const useConverter = (
       log(`移行進捗: ファイル移行中 (0/${files.length})`, 'info', migrationId, 30);
 
       let fileCount = 0;
-      /** 直近に全体 (x/n) を出した完了件数（毎件ログしないためのまとめ幅＝プールと同じ） */
-      let lastReportedFileCount = 0;
-      /** ファイル1件あたりの処理（DL+UL 含む）が終わったタイミングで全体進捗を更新（開始数ベースだと並列で先に100%になる） */
+      /** ファイル1件完了のたびに全体 (x/n) を更新（並列でも完了数＝意味のある進捗） */
       const bumpFilePhaseProgress = () => {
         if (files.length === 0) return;
         fileCount++;
-        const stride = MIGRATION_POOL_SIZE;
-        const nextThreshold = lastReportedFileCount + stride;
-        const shouldReport =
-          fileCount === files.length || fileCount >= nextThreshold;
-        if (!shouldReport) return;
-        lastReportedFileCount = fileCount;
         const fp = 30 + Math.round((fileCount / files.length) * 70);
         log(`移行進捗: ファイル移行中 (${fileCount}/${files.length})`, 'info', migrationId, fp);
         setStatus({ type: 'info', message: `ファイルを移行中... (${fileCount}/${files.length})` });
@@ -1156,6 +1148,7 @@ export const useConverter = (
                 form, null, fileLogId, [50, 100], docxBlob.size || 0,
                 { metadata: { name: baseFileName, mimeType: 'application/vnd.google-apps.document', parents: gParentId !== 'root' ? [gParentId] : [] }, fileBlob: docxBlob, filename: baseFileName }
               );
+              const gDrivePath = rootFolderName + '/' + (dropboxRelativePathForLog(rootPath, file) || baseFileName);
               if (uploadRes.ok) {
                 try {
                   const upData = await uploadRes.json();
@@ -1165,10 +1158,22 @@ export const useConverter = (
                 } catch (e) {
                   console.warn('[GDoc] チェックリスト API 後処理:', e?.message || e);
                 }
+                log(`Paper変換完了: ${gDrivePath}`, 'success', fileLogId, 100);
+                markdownText = textToSave = docxBlob = form = null;
+              } else {
+                let detail = '';
+                try {
+                  detail = await uploadRes.text();
+                } catch (_) {
+                  /* ignore */
+                }
+                log(
+                  `Paperアップロード失敗: ${gDrivePath}${detail ? ` — ${detail.slice(0, 400)}` : ''}`,
+                  'error',
+                  fileLogId,
+                  100
+                );
               }
-              const gDrivePath = rootFolderName + '/' + (dropboxRelativePathForLog(rootPath, file) || baseFileName);
-              log(`Paper変換完了: ${gDrivePath}`, 'success', fileLogId, 100);
-              markdownText = textToSave = docxBlob = form = null;
             } else {
               const gDrivePathFail = rootFolderName + '/' + (dropboxRelativePathForLog(rootPath, file) || baseFileName);
               log(`Paperエクスポート失敗: ${gDrivePathFail}`, 'error', fileLogId, 100);

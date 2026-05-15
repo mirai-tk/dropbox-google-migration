@@ -14,11 +14,11 @@ import httpx
 from ..dropbox_oauth_refresh import dropbox_request_with_token_refresh
 from docx import Document
 from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
-from docx.shared import Inches, Pt
+from docx.shared import Emu, Inches, Pt, Twips
 from docx.text.paragraph import Paragraph
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,12 @@ _INLINE_RE = re.compile(
 _TABLE_SEP_RE = re.compile(
     r"^\|?\s*[:\-]+\s*(\|\s*[:\-]+\s*)*\|?$"
 )
+
+# Paper 由来の <br> / <br/>（セル内・本文）
+_BR_SPLIT_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+
+# セル内 Markdown 画像 ![](...)
+_IMG_MD_CELL = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 
 # チェックリスト行: - [ ] / [x] 等。括弧内は空=未チェック、x/X=チェック済み（半角スペース複数も可）
 _CHECK_LINE_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+\.\s+)?\[\s*([xX]?)\s*\]\s*(.*)$")
@@ -122,8 +128,8 @@ def _add_hyperlink(paragraph: Paragraph, text: str, url: str) -> None:
     paragraph._p.append(hyperlink)
 
 
-def _add_inline_to_paragraph(paragraph: Paragraph, text: str) -> None:
-    """parseInline に相当。"""
+def _append_inline_runs(paragraph: Paragraph, text: str) -> None:
+    """`<br>` を含まない断片に対する parseInline 相当。"""
     pos = 0
     for m in _INLINE_RE.finditer(text):
         if m.start() > pos:
@@ -143,6 +149,40 @@ def _add_inline_to_paragraph(paragraph: Paragraph, text: str) -> None:
         pos = m.end()
     if pos < len(text):
         paragraph.add_run(text[pos:])
+
+
+def _add_inline_to_paragraph(paragraph: Paragraph, text: str) -> None:
+    """parseInline（markdownParser.js）に相当。Paper の `<br>` は段落内改行にする。"""
+    parts = _BR_SPLIT_RE.split(text)
+    for i, part in enumerate(parts):
+        if i > 0:
+            paragraph.add_run().add_break(WD_BREAK.LINE)
+        _append_inline_runs(paragraph, part)
+
+
+async def _add_mixed_cell_content(
+    paragraph: Paragraph,
+    text: str,
+    fetch_image,
+) -> None:
+    """テーブルセル: ``![](url)`` を埋め込み、前後はインライン（太字・リンク等）。"""
+    pos = 0
+    for m in _IMG_MD_CELL.finditer(text):
+        if m.start() > pos:
+            _add_inline_to_paragraph(paragraph, text[pos : m.start()])
+        url = m.group(2)
+        data = await fetch_image(url)
+        if data:
+            try:
+                run = paragraph.add_run()
+                run.add_picture(BytesIO(data), width=Inches(1.65), height=Inches(1.24))
+            except Exception:
+                paragraph.add_run(f"[画像を docx に埋め込めません: {url}]")
+        else:
+            paragraph.add_run(f"[画像取得失敗: {url}]")
+        pos = m.end()
+    if pos < len(text):
+        _add_inline_to_paragraph(paragraph, text[pos:])
 
 
 def _set_cell_borders(cell, color: str = "DFE1E5", sz: str = "8") -> None:
@@ -172,6 +212,42 @@ def _set_cell_shading(cell, fill_hex: str) -> None:
     tc_pr.append(shd)
 
 
+def _usable_body_width(doc: Document) -> int:
+    """python-docx ``Document._block_width`` と同じ本文幅（EMU の int）。"""
+    section = doc.sections[-1]
+    page_width = section.page_width or Inches(8.5)
+    left_margin = section.left_margin or Inches(1)
+    right_margin = section.right_margin or Inches(1)
+    return int(page_width - left_margin - right_margin)
+
+
+def _set_table_width_fixed_layout(doc: Document, table, ncols: int) -> None:
+    """Google ドキュメント等でテーブルが極端に縮むのを抑える。
+
+    ``w:tblW`` を本文幅の ``dxa`` で明示し、``tblLayout=fixed`` にして列幅を twips で割り当てる。
+    （``pct`` だけだと取り込み側によっては無視されやすい。セル編集後に呼ぶこと。）
+    """
+    if ncols <= 0:
+        return
+    usable_emu = _usable_body_width(doc)
+    total_twips = max(1440, Emu(usable_emu).twips)  # 最低 ~1in、異常値ガード
+    base = total_twips // ncols
+    rem = total_twips % ncols
+    col_twips = [base + (1 if i < rem else 0) for i in range(ncols)]
+
+    table.autofit = False
+    tbl_pr = table._tbl.tblPr
+    tbl_w = tbl_pr.find(qn("w:tblW"))
+    if tbl_w is None:
+        tbl_w = OxmlElement("w:tblW")
+        tbl_pr.append(tbl_w)
+    tbl_w.set(qn("w:type"), "dxa")
+    tbl_w.set(qn("w:w"), str(total_twips))
+
+    for i, tw in enumerate(col_twips):
+        table.columns[i].width = Twips(tw)
+
+
 def _add_thematic_break(doc: Document) -> None:
     """thematicBreak の簡易代替（下線のみ）。"""
     p = doc.add_paragraph()
@@ -188,9 +264,10 @@ def _add_thematic_break(doc: Document) -> None:
     p_pr.append(p_bdr)
 
 
-def _flush_table_docx(
+async def _flush_table_docx(
     doc: Document,
     table_rows_buffer: list[str],
+    fetch_image,
 ) -> None:
     if len(table_rows_buffer) < 2:
         for row in table_rows_buffer:
@@ -217,13 +294,15 @@ def _flush_table_docx(
             cell = table.rows[ri].cells[ci]
             cell.text = ""
             p = cell.paragraphs[0]
-            _add_inline_to_paragraph(p, cell_text)
+            await _add_mixed_cell_content(p, cell_text, fetch_image)
             cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
             _set_cell_borders(cell)
             if ri == 0:
                 for run in p.runs:
-                    run.bold = True
+                    if run.text:
+                        run.bold = True
                 _set_cell_shading(cell, "E8F0FE")
+    _set_table_width_fixed_layout(doc, table, ncols)
 
 
 async def markdown_to_docx_bytes(
@@ -286,7 +365,7 @@ async def markdown_to_docx_bytes(
             table_rows_buffer.append(line)
             continue
         if in_table:
-            _flush_table_docx(doc, table_rows_buffer)
+            await _flush_table_docx(doc, table_rows_buffer, fetch_image)
             table_rows_buffer = []
             in_table = False
 
@@ -365,7 +444,7 @@ async def markdown_to_docx_bytes(
             _add_inline_to_paragraph(p, line)
 
     if in_table:
-        _flush_table_docx(doc, table_rows_buffer)
+        await _flush_table_docx(doc, table_rows_buffer, fetch_image)
 
     # Normal スタイルの東アジアフォント（既存の見た目に寄せる）
     try:

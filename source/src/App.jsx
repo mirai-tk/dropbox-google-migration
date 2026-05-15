@@ -171,6 +171,13 @@ const App = () => {
           ) {
             merged.message = existing.message;
           }
+          if (
+            merged.message &&
+            /完了|失敗|エラー:|スキップ（/.test(merged.message) &&
+            log.detail === undefined
+          ) {
+            merged.detail = undefined;
+          }
           newLogs[existingIdx] = ensureTime(merged);
           return newLogs;
         }
@@ -1190,25 +1197,6 @@ const App = () => {
         gDriveToken={gdrive.gDriveToken}
       />
 
-      {/* Bulk Save Global Action Overlay */}
-      {dropbox.selectedFileIds.length > 0 && (
-        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-[150] animate-in slide-in-from-bottom-10 duration-500">
-           <button
-             onClick={() => converter.bulkSaveToGoogleDocs(dropbox.selectedFileIds, dropbox.folderFiles)}
-             disabled={converter.isGDriveProcessing}
-             className="px-8 py-4 bg-slate-900 text-white rounded-[2rem] shadow-2xl flex items-center gap-4 hover:bg-emerald-600 transition-all border border-slate-800"
-           >
-             <div className="w-8 h-8 bg-emerald-500 rounded-xl flex items-center justify-center">
-               <ShieldCheck size={18} />
-             </div>
-             <div className="text-left">
-               <p className="text-[10px] font-black uppercase tracking-widest leading-none mb-1 text-emerald-400">Bulk Conversion</p>
-               <p className="text-xs font-black">{dropbox.selectedFileIds.length} 個のファイルをマイドライブへ保存</p>
-             </div>
-             {converter.isGDriveProcessing && <RefreshCw className="animate-spin ml-4" size={20} />}
-           </button>
-        </div>
-      )}
     </div>
   );
 };

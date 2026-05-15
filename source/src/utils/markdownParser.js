@@ -1,4 +1,4 @@
-import { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, BorderStyle, ImageRun, ExternalHyperlink } from 'docx';
+import { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, BorderStyle, ImageRun, ExternalHyperlink, TableLayoutType } from 'docx';
 import { marked } from 'marked';
 
 /**
@@ -125,7 +125,10 @@ export const generateDocxBlob = async (title, markdown, dbToken = null) => {
 
 
 
-  const parseInline = (text) => {
+  // Paper 由来の HTML 改行（テーブルセル・本文でそのまま残ることがある）
+  const BR_TAG_SPLIT = /<br\s*\/?>/gi;
+
+  const parseInlineFragment = (text) => {
     const parts = [];
     // リンク: [alt](url)
     // 太字: **text** または __text__ (単語境界等を考慮して中身の_を誤爆させない)
@@ -173,60 +176,141 @@ export const generateDocxBlob = async (title, markdown, dbToken = null) => {
     return parts.length > 0 ? parts : [new TextRun(text)];
   };
 
+  const parseInline = (text) => {
+    if (text == null || text === '') {
+      return [new TextRun('')];
+    }
+    const chunks = text.split(BR_TAG_SPLIT);
+    const runs = [];
+    chunks.forEach((chunk, idx) => {
+      if (idx > 0) {
+        runs.push(new TextRun({ break: 1 }));
+      }
+      runs.push(...parseInlineFragment(chunk));
+    });
+    return runs.length > 0 ? runs : [new TextRun('')];
+  };
+
+  const fetchImageBufferForDocx = async (imgUrl) => {
+    const isDropboxPaperImage = imgUrl.includes('paper-attachments.dropbox.com') || imgUrl.includes('paper-attachments.dropboxusercontent.com');
+    const proxyUrl = isDropboxPaperImage
+      ? imgUrl.replace(/^https:\/\/paper-attachments\.dropbox(?:usercontent)?\.com/, '/proxy/dropbox-image')
+      : `/api/proxy-image?url=${encodeURIComponent(imgUrl)}`;
+
+    const fetchOptions = (isDropboxPaperImage && dbToken)
+      ? { headers: { 'Authorization': `Bearer ${dbToken}` } }
+      : {};
+    const response = await fetch(proxyUrl, fetchOptions);
+    if (!response.ok) return null;
+    return await response.arrayBuffer();
+  };
+
+  /** テーブルセル内の ![](url) を本文と同じ経路で取得して ImageRun にする（セル幅向けにやや小さめ） */
+  const buildTableCellParagraphChildren = async (cellMd) => {
+    const s = cellMd.trim();
+    const chunk = [];
+    let last = 0;
+    // matchAll は pywebview 等の古い WebKit で未対応のことがあり、Paper→docx 全体が落ちるため exec で走査する
+    const imgCellRe = /!\[([^\]]*)\]\(([^)]+)\)/g;
+    let m;
+    while ((m = imgCellRe.exec(s)) !== null) {
+      if (m.index > last) {
+        chunk.push(...parseInline(s.slice(last, m.index)));
+      }
+      try {
+        const buf = await fetchImageBufferForDocx(m[2]);
+        if (buf) {
+          chunk.push(new ImageRun({
+            data: buf,
+            transformation: { width: 200, height: 150 },
+          }));
+        } else {
+          chunk.push(new TextRun({ text: '[画像取得失敗]' }));
+        }
+      } catch (err) {
+        console.error('Table cell image fetch failed:', err);
+        chunk.push(new TextRun({ text: '[画像取得失敗]' }));
+      }
+      last = m.index + m[0].length;
+    }
+    if (last < s.length) {
+      chunk.push(...parseInline(s.slice(last)));
+    }
+    return chunk.length > 0 ? chunk : [new TextRun('')];
+  };
+
   let tableRowsBuffer = [];
   let inTable = false;
 
   // docx の w:sz は 1/8 pt。1 だと ~0.125pt で GDoc 取り込み後ほぼ見えないため 8〜12 程度にする
   const TABLE_BORDER = { style: BorderStyle.SINGLE, size: 12, color: 'DFE1E5' };
   const TABLE_HEADER_FILL = 'E8F0FE';
+  // docx@9 の Table は columnWidths 未指定時、各列がデフォルト 100 twips（極細）になり Google ドキュメントで潰れる
+  const TABLE_BODY_WIDTH_TWIPS = 9360; // 約 6.5in（レター想定の本文幅に近い）
 
-  const flushTableDocx = () => {
+  const distributeTableColumnWidths = (columnCount) => {
+    if (columnCount < 1) return [];
+    const base = Math.floor(TABLE_BODY_WIDTH_TWIPS / columnCount);
+    const rem = TABLE_BODY_WIDTH_TWIPS % columnCount;
+    return Array.from({ length: columnCount }, (_, i) => base + (i < rem ? 1 : 0));
+  };
+
+  const flushTableDocx = async () => {
     if (tableRowsBuffer.length < 2) {
-      tableRowsBuffer.forEach(row => {
+      for (const row of tableRowsBuffer) {
         children.push(new Paragraph({ children: parseInline(row) }));
-      });
+      }
     } else {
       const tableRows = [];
       const parsedRows = tableRowsBuffer
         .filter(row => !row.trim().match(/^\|?\s*[:\-]+\s*(\|\s*[:\-]+\s*)*\|?$/))
         .map(row => row.trim().replace(/^\|/, '').replace(/\|$/, '').split('|'));
 
+      let columnCount = 0;
       if (parsedRows.length > 0) {
-        const expectedCols = parsedRows[0].length;
-        parsedRows.forEach((cells, idx) => {
+        columnCount = parsedRows[0].length;
+        for (let idx = 0; idx < parsedRows.length; idx++) {
+          const cells = parsedRows[idx];
           let normalizedCells = [...cells];
-          while (normalizedCells.length < expectedCols) normalizedCells.push("");
-          if (normalizedCells.length > expectedCols) normalizedCells = normalizedCells.slice(0, expectedCols);
+          while (normalizedCells.length < columnCount) normalizedCells.push("");
+          if (normalizedCells.length > columnCount) normalizedCells = normalizedCells.slice(0, columnCount);
 
           const isHeaderRow = idx === 0;
-          const tableCells = normalizedCells.map(cell => {
-            return new TableCell({
-              children: [
-                new Paragraph({
-                  children: parseInline(cell.trim()),
-                  ...(isHeaderRow ? { run: { bold: true } } : {}),
-                }),
-              ],
-              shading: isHeaderRow ? { fill: TABLE_HEADER_FILL, color: '000000' } : undefined,
-              borders: {
-                top: TABLE_BORDER,
-                bottom: TABLE_BORDER,
-                left: TABLE_BORDER,
-                right: TABLE_BORDER,
-              },
-              verticalAlign: 'center',
-              margins: { top: 100, bottom: 100, left: 120, right: 120 },
-            });
-          });
+          const tableCells = [];
+          for (const cell of normalizedCells) {
+            const cellChildren = await buildTableCellParagraphChildren(cell);
+            tableCells.push(
+              new TableCell({
+                children: [
+                  new Paragraph({
+                    children: cellChildren,
+                    ...(isHeaderRow ? { run: { bold: true } } : {}),
+                  }),
+                ],
+                shading: isHeaderRow ? { fill: TABLE_HEADER_FILL, color: '000000' } : undefined,
+                borders: {
+                  top: TABLE_BORDER,
+                  bottom: TABLE_BORDER,
+                  left: TABLE_BORDER,
+                  right: TABLE_BORDER,
+                },
+                verticalAlign: 'center',
+                margins: { top: 100, bottom: 100, left: 120, right: 120 },
+              })
+            );
+          }
           tableRows.push(new TableRow({ children: tableCells }));
-        });
+        }
       }
 
       if (tableRows.length > 0) {
+        const columnWidths = distributeTableColumnWidths(Math.max(1, columnCount));
         children.push(
           new Table({
             rows: tableRows,
             width: { size: 100, type: WidthType.PERCENTAGE },
+            columnWidths,
+            layout: TableLayoutType.FIXED,
             borders: {
               top: TABLE_BORDER,
               bottom: TABLE_BORDER,
@@ -249,7 +333,7 @@ export const generateDocxBlob = async (title, markdown, dbToken = null) => {
       inTable = true;
       tableRowsBuffer.push(line);
     } else {
-      if (inTable) flushTableDocx();
+      if (inTable) await flushTableDocx();
       const trimmedLine = line.trim();
       if (!trimmedLine) {
         children.push(new Paragraph({ text: "" }));
@@ -258,18 +342,8 @@ export const generateDocxBlob = async (title, markdown, dbToken = null) => {
       const imgMatch = trimmedLine.match(/^!\[([^\]]*)\]\(([^)]+)\)$/);
       if (imgMatch) {
         try {
-          const imgUrl = imgMatch[2];
-          const isDropboxPaperImage = imgUrl.includes('paper-attachments.dropbox.com') || imgUrl.includes('paper-attachments.dropboxusercontent.com');
-          const proxyUrl = isDropboxPaperImage
-            ? imgUrl.replace(/^https:\/\/paper-attachments\.dropbox(?:usercontent)?\.com/, '/proxy/dropbox-image')
-            : `/api/proxy-image?url=${encodeURIComponent(imgUrl)}`;
-
-          const fetchOptions = (isDropboxPaperImage && dbToken)
-            ? { headers: { 'Authorization': `Bearer ${dbToken}` } }
-            : {};
-          const response = await fetch(proxyUrl, fetchOptions);
-          if (response.ok) {
-            const buffer = await response.arrayBuffer();
+          const buffer = await fetchImageBufferForDocx(imgMatch[2]);
+          if (buffer) {
             children.push(new Paragraph({
               children: [
                 new ImageRun({
@@ -287,6 +361,8 @@ export const generateDocxBlob = async (title, markdown, dbToken = null) => {
           children.push(new Paragraph({ text: `[画像取得失敗: ${imgMatch[2]}]`, spacing: { before: 120, after: 120 } }));
           continue;
         }
+        children.push(new Paragraph({ text: `[画像取得失敗: ${imgMatch[2]}]`, spacing: { before: 120, after: 120 } }));
+        continue;
       }
 
       if (line.startsWith('# ')) {
@@ -341,7 +417,7 @@ export const generateDocxBlob = async (title, markdown, dbToken = null) => {
     }
   }
 
-  if (inTable) flushTableDocx();
+  if (inTable) await flushTableDocx();
 
   const doc = new Document({
     sections: [{ children: children }],

@@ -200,9 +200,42 @@ export const useDropbox = (setStatus) => {
         );
       }
 
-      const data = await response.json();
+      let data = await response.json();
+      let allEntries = [...(data.entries || [])];
+      // list_folder は1回あたり最大約2000件。has_more を無視すると以降のエントリが一覧から消える
+      while (data.has_more) {
+        response = await fetch('https://api.dropboxapi.com/2/files/list_folder/continue', {
+          method: 'POST',
+          headers: getApiHeaders(false, nsId, activeToken),
+          body: JSON.stringify({ cursor: data.cursor })
+        });
+        if (response.status === 401 && dbRefreshToken) {
+          const refreshed = await refreshDropboxToken();
+          if (refreshed?.access_token) {
+            activeToken = refreshed.access_token;
+            response = await fetch('https://api.dropboxapi.com/2/files/list_folder/continue', {
+              method: 'POST',
+              headers: getApiHeaders(false, nsId, activeToken),
+              body: JSON.stringify({ cursor: data.cursor })
+            });
+          }
+        }
+        if (response.status === 401) {
+          handleDropboxLogout(false);
+          return;
+        }
+        if (!response.ok) {
+          setInaccessiblePaths((prev) => new Set(prev).add(pathKey));
+          const snippet = (await response.text()).slice(0, 400);
+          throw new Error(
+            snippet ? `フォルダリストの取得に失敗しました: ${snippet}` : 'フォルダリストの取得に失敗しました'
+          );
+        }
+        data = await response.json();
+        allEntries = [...allEntries, ...(data.entries || [])];
+      }
       // フォルダ優先、その中で名前順にソート
-      const sortedEntries = (data.entries || []).sort((a, b) => {
+      const sortedEntries = allEntries.sort((a, b) => {
         if (a['.tag'] === 'folder' && b['.tag'] !== 'folder') return -1;
         if (a['.tag'] !== 'folder' && b['.tag'] === 'folder') return 1;
         return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
