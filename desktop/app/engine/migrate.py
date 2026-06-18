@@ -1020,7 +1020,11 @@ async def run_folder_migration(
                     await list_task
                 except asyncio.CancelledError:
                     pass
-            yield {"type": "log", "message": f"リスト取得失敗: {e}", "level": "error"}
+            msg = f"リスト取得失敗: {e}"
+            err_s = str(e)
+            if any(code in err_s for code in ("503", "502", "429", "504")):
+                msg += "（Dropbox 側の一時障害の可能性があります。少し待ってから再試行してください）"
+            yield {"type": "log", "message": msg, "level": "error"}
             return
 
         folders = [

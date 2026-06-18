@@ -1,6 +1,7 @@
 """長時間マイグレーション向け: Dropbox アクセストークンのリフレッシュと 401 再試行。"""
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 
@@ -10,6 +11,14 @@ from .config import get_settings
 from .migration_auth import MigrationAuthError
 
 logger = logging.getLogger(__name__)
+
+# レート制限・一時障害（503 Service Unavailable 等）
+DROPBOX_TRANSIENT_HTTP_CODES = frozenset({408, 429, 500, 502, 503, 504})
+DROPBOX_API_MAX_ATTEMPTS = 6
+
+
+def _dropbox_http_is_transient(status: int) -> bool:
+    return status in DROPBOX_TRANSIENT_HTTP_CODES
 
 
 async def refresh_dropbox_access_token(
@@ -57,15 +66,39 @@ async def dropbox_request_with_token_refresh(
     token_ref: list[str],
     refresh: str | None,
     do: Callable[[str], Awaitable[httpx.Response]],
+    *,
+    max_attempts: int = DROPBOX_API_MAX_ATTEMPTS,
 ) -> httpx.Response:
-    r = await do(token_ref[0])
-    if r.status_code == 401 and refresh and await refresh_dropbox_access_token(
-        client, token_ref, refresh
-    ):
+    last_r: httpx.Response | None = None
+    for attempt in range(max_attempts):
         r = await do(token_ref[0])
-    if r.status_code == 401:
-        raise MigrationAuthError(
-            "Dropbox の認証が無効です（アクセストークンの更新に失敗しました）。"
-            " Dropbox に再接続してから再度お試しください。"
+        if r.status_code == 401 and refresh and await refresh_dropbox_access_token(
+            client, token_ref, refresh
+        ):
+            r = await do(token_ref[0])
+        if r.status_code == 401:
+            raise MigrationAuthError(
+                "Dropbox の認証が無効です（アクセストークンの更新に失敗しました）。"
+                " Dropbox に再接続してから再度お試しください。"
+            )
+        if r.is_success or not _dropbox_http_is_transient(r.status_code):
+            return r
+        last_r = r
+        if attempt >= max_attempts - 1:
+            break
+        delay = min(2.0 * (2**attempt), 60.0)
+        retry_after = r.headers.get("Retry-After")
+        if retry_after:
+            try:
+                delay = max(delay, float(retry_after))
+            except ValueError:
+                pass
+        logger.warning(
+            "Dropbox API transient HTTP %s, retry %d/%d",
+            r.status_code,
+            attempt + 1,
+            max_attempts,
         )
-    return r
+        await asyncio.sleep(delay)
+    assert last_r is not None
+    return last_r

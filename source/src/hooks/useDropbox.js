@@ -2,6 +2,32 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { usesBackendOAuth } from '../utils/desktopEnv';
 import { deriveDropboxAccess } from '../utils/accessLevel';
 
+const DROPBOX_TRANSIENT_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+const DROPBOX_FETCH_MAX_ATTEMPTS = 6;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** 503 等の一時障害で即失敗せず指数バックオフで再試行 */
+async function fetchDropboxWithTransientRetry(doFetch) {
+  let lastResponse = null;
+  for (let attempt = 0; attempt < DROPBOX_FETCH_MAX_ATTEMPTS; attempt++) {
+    const response = await doFetch();
+    lastResponse = response;
+    if (response.ok || !DROPBOX_TRANSIENT_STATUSES.has(response.status)) {
+      return response;
+    }
+    if (attempt >= DROPBOX_FETCH_MAX_ATTEMPTS - 1) break;
+    const retryAfter = response.headers.get('Retry-After');
+    let delayMs = Math.min(2000 * (2 ** attempt), 60000);
+    if (retryAfter) {
+      const parsed = parseFloat(retryAfter);
+      if (!Number.isNaN(parsed)) delayMs = Math.max(delayMs, parsed * 1000);
+    }
+    await sleep(delayMs);
+  }
+  return lastResponse;
+}
+
 export const useDropbox = (setStatus) => {
   const [dbToken, setDbToken] = useState(localStorage.getItem('dropbox_token'));
   const [dbRefreshToken, setDbRefreshToken] = useState(localStorage.getItem('dropbox_refresh_token'));
@@ -178,13 +204,13 @@ export const useDropbox = (setStatus) => {
           })
         });
 
-      let response = await doList(activeToken);
+      let response = await fetchDropboxWithTransientRetry(() => doList(activeToken));
 
       if (response.status === 401 && dbRefreshToken) {
         const refreshed = await refreshDropboxToken();
         if (refreshed?.access_token) {
           activeToken = refreshed.access_token;
-          response = await doList(activeToken);
+          response = await fetchDropboxWithTransientRetry(() => doList(activeToken));
         }
       }
 
@@ -204,20 +230,24 @@ export const useDropbox = (setStatus) => {
       let allEntries = [...(data.entries || [])];
       // list_folder は1回あたり最大約2000件。has_more を無視すると以降のエントリが一覧から消える
       while (data.has_more) {
-        response = await fetch('https://api.dropboxapi.com/2/files/list_folder/continue', {
-          method: 'POST',
-          headers: getApiHeaders(false, nsId, activeToken),
-          body: JSON.stringify({ cursor: data.cursor })
-        });
+        response = await fetchDropboxWithTransientRetry(() =>
+          fetch('https://api.dropboxapi.com/2/files/list_folder/continue', {
+            method: 'POST',
+            headers: getApiHeaders(false, nsId, activeToken),
+            body: JSON.stringify({ cursor: data.cursor })
+          })
+        );
         if (response.status === 401 && dbRefreshToken) {
           const refreshed = await refreshDropboxToken();
           if (refreshed?.access_token) {
             activeToken = refreshed.access_token;
-            response = await fetch('https://api.dropboxapi.com/2/files/list_folder/continue', {
-              method: 'POST',
-              headers: getApiHeaders(false, nsId, activeToken),
-              body: JSON.stringify({ cursor: data.cursor })
-            });
+            response = await fetchDropboxWithTransientRetry(() =>
+              fetch('https://api.dropboxapi.com/2/files/list_folder/continue', {
+                method: 'POST',
+                headers: getApiHeaders(false, nsId, activeToken),
+                body: JSON.stringify({ cursor: data.cursor })
+              })
+            );
           }
         }
         if (response.status === 401) {
@@ -355,13 +385,13 @@ export const useDropbox = (setStatus) => {
           })
         });
 
-      let response = await doList(activeToken);
+      let response = await fetchDropboxWithTransientRetry(() => doList(activeToken));
 
       if (response.status === 401 && dbRefreshToken) {
         const refreshed = await refreshDropboxToken();
         if (refreshed?.access_token) {
           activeToken = refreshed.access_token;
-          response = await doList(activeToken);
+          response = await fetchDropboxWithTransientRetry(() => doList(activeToken));
         }
       }
 
@@ -375,20 +405,24 @@ export const useDropbox = (setStatus) => {
       allEntries = [...data.entries];
 
       while (data.has_more) {
-        response = await fetch('https://api.dropboxapi.com/2/files/list_folder/continue', {
-          method: 'POST',
-          headers: getApiHeaders(false, null, activeToken),
-          body: JSON.stringify({ cursor: data.cursor })
-        });
+        response = await fetchDropboxWithTransientRetry(() =>
+          fetch('https://api.dropboxapi.com/2/files/list_folder/continue', {
+            method: 'POST',
+            headers: getApiHeaders(false, null, activeToken),
+            body: JSON.stringify({ cursor: data.cursor })
+          })
+        );
         if (response.status === 401 && dbRefreshToken) {
           const refreshed = await refreshDropboxToken();
           if (refreshed?.access_token) {
             activeToken = refreshed.access_token;
-            response = await fetch('https://api.dropboxapi.com/2/files/list_folder/continue', {
-              method: 'POST',
-              headers: getApiHeaders(false, null, activeToken),
-              body: JSON.stringify({ cursor: data.cursor })
-            });
+            response = await fetchDropboxWithTransientRetry(() =>
+              fetch('https://api.dropboxapi.com/2/files/list_folder/continue', {
+                method: 'POST',
+                headers: getApiHeaders(false, null, activeToken),
+                body: JSON.stringify({ cursor: data.cursor })
+              })
+            );
           }
         }
         if (!response.ok) throw new Error('フォルダ内リストの継続取得に失敗しました');
