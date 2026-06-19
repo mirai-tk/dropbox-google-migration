@@ -13,6 +13,7 @@ from .engine.migrate import (
     request_migration_stop,
     run_folder_migration,
 )
+from .engine.paper_shortcut import export_paper_markdown_from_shortcut
 from .engine.resume_checkpoint import (
     delete_checkpoint,
     list_checkpoints_metadata,
@@ -34,6 +35,53 @@ class MigrateBody(BaseModel):
     google_token: str
     google_refresh_token: str | None = None
     migration_id: str | None = None
+
+
+class PaperExportShortcutBody(BaseModel):
+    doc_id: str
+    cloud_docs_url: str | None = None
+    shared_link_url: str | None = None
+    file_name: str | None = None
+    file_id_gid: str | None = None
+    content_access_token: str | None = None
+    dropbox_token: str
+    dropbox_refresh_token: str | None = None
+    dropbox_ns_id: str | None = None
+
+
+@router.post("/paper/export-shortcut")
+async def paper_export_shortcut(body: PaperExportShortcutBody):
+    """GDrive 上の .paper ショートカット（cloud_docs URL）から markdown を取得。"""
+    token_ref = [body.dropbox_token]
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=60.0, read=120.0, write=60.0, pool=60.0)
+        ) as client:
+            markdown, via, attempts = await export_paper_markdown_from_shortcut(
+                client,
+                token_ref,
+                body.dropbox_refresh_token,
+                body.doc_id,
+                body.content_access_token,
+                body.dropbox_ns_id,
+                file_name=body.file_name,
+                file_id_gid=body.file_id_gid,
+                cloud_docs_url=body.cloud_docs_url,
+                shared_link_url=body.shared_link_url,
+            )
+    except Exception as exc:
+        logger.exception("paper export-shortcut failed")
+        raise HTTPException(
+            status_code=500,
+            detail={"ok": False, "error": str(exc), "attempts": []},
+        ) from exc
+    if markdown is not None:
+        return {"ok": True, "markdown": markdown, "via": via}
+    return {
+        "ok": False,
+        "error": "Paper の export に失敗しました",
+        "attempts": attempts,
+    }
 
 
 @router.post("/migrate")

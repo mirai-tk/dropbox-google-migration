@@ -37,6 +37,153 @@ const asyncPool = async (poolLimit, array, iteratorFn) => {
   return Promise.all(ret);
 };
 
+const PAPER_FILE_EXT_RE = /\.(paper|papert)$/i;
+
+/** GDrive 上で Paper 変換の対象（.paper / .papert のみ） */
+export function isGDrivePaperCandidate(file) {
+  if (!file || file.mimeType === 'application/vnd.google-apps.folder') return false;
+  if (file.mimeType === 'application/vnd.google-apps.document') return false;
+  return PAPER_FILE_EXT_RE.test(file.name || '');
+}
+
+function paperBaseName(fileName) {
+  return (fileName || '').replace(PAPER_FILE_EXT_RE, '') || fileName;
+}
+
+/** Finder 等でコピーされた .paper（JSON ショートカット）を解析 */
+function parsePaperShortcutFile(text) {
+  try {
+    const data = JSON.parse(String(text).trim());
+    if (!data || typeof data !== 'object') return null;
+    const url = data.url;
+    if (typeof url !== 'string') return null;
+    const m = url.match(/\/cloud_docs\/view\/([^/?#]+)/i);
+    if (!m) return null;
+    const contentAccessToken =
+      typeof data.content_access_token === 'string' ? data.content_access_token : null;
+    let fileIdGid = null;
+    try {
+      const u = new URL(url);
+      const gid = u.searchParams.get('fileid_gid') || u.searchParams.get('file_id');
+      if (gid) fileIdGid = gid.startsWith('id:') ? gid : `id:${gid}`;
+    } catch {
+      /* ignore */
+    }
+    return { docId: m[1], viewId: m[1], url, contentAccessToken, fileIdGid };
+  } catch {
+    return null;
+  }
+}
+
+async function exportPaperMarkdownRequest(path, token, getApiHeaders, asciiSafeJson, rootNamespaceId, { skipPathRoot = false } = {}) {
+  const headers = getApiHeaders(true, skipPathRoot ? null : rootNamespaceId, token);
+  if (skipPathRoot) {
+    delete headers['Dropbox-API-Path-Root'];
+  }
+  headers['Dropbox-API-Arg'] = asciiSafeJson({ path, export_format: 'markdown' });
+  const response = await fetch('https://content.dropboxapi.com/2/files/export', {
+    method: 'POST',
+    headers,
+  });
+  if (response.ok) {
+    return { ok: true, text: await response.text(), path, status: response.status };
+  }
+  let detail = '';
+  try {
+    detail = (await response.text()).slice(0, 400);
+  } catch {
+    /* ignore */
+  }
+  return { ok: false, status: response.status, detail };
+}
+
+async function paperDocsDownloadRequest(docId, token, getApiHeaders, asciiSafeJson, rootNamespaceId, { skipPathRoot = false } = {}) {
+  const headers = getApiHeaders(true, skipPathRoot ? null : rootNamespaceId, token);
+  if (skipPathRoot) {
+    delete headers['Dropbox-API-Path-Root'];
+  }
+  headers['Dropbox-API-Arg'] = asciiSafeJson({ doc_id: docId, export_format: 'markdown' });
+  const response = await fetch('https://content.dropboxapi.com/2/paper/docs/download', {
+    method: 'POST',
+    headers,
+  });
+  if (response.ok) {
+    return { ok: true, text: await response.text(), status: response.status };
+  }
+  let detail = '';
+  try {
+    detail = (await response.text()).slice(0, 400);
+  } catch {
+    /* ignore */
+  }
+  return { ok: false, status: response.status, detail };
+}
+
+async function resolveDropboxPathByFileId(docId, token, getApiHeaders, rootNamespaceId, { skipPathRoot = false } = {}) {
+  const headers = getApiHeaders(false, skipPathRoot ? null : rootNamespaceId, token);
+  if (skipPathRoot) {
+    delete headers['Dropbox-API-Path-Root'];
+  }
+  const response = await fetch('https://api.dropboxapi.com/2/files/get_metadata', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ path: `id:${docId}`, include_export_info: true }),
+  });
+  if (!response.ok) return null;
+  try {
+    const data = await response.json();
+    return data.path_lower || data.path_display || null;
+  } catch {
+    return null;
+  }
+}
+
+/** ブラウザ側フォールバック（デスクトップは Python API を優先） */
+async function exportPaperFromShortcutInBrowser(shortcut, dbToken, getApiHeaders, asciiSafeJson, rootNamespaceId) {
+  const { docId, contentAccessToken } = shortcut;
+  const idPath = `id:${docId}`;
+  const attempts = [];
+
+  const tryExportPath = async (path, token, skipPathRoot, label) => {
+    const r = await exportPaperMarkdownRequest(path, token, getApiHeaders, asciiSafeJson, rootNamespaceId, { skipPathRoot });
+    attempts.push({ method: label, status: r.status, detail: r.detail });
+    return r.ok ? r.text : null;
+  };
+
+  for (const skipPathRoot of [true, false]) {
+    const metaPath = await resolveDropboxPathByFileId(docId, dbToken, getApiHeaders, rootNamespaceId, { skipPathRoot });
+    if (metaPath) {
+      const text = await tryExportPath(metaPath, dbToken, skipPathRoot, `files/export path=${metaPath}`);
+      if (text) return { text, via: metaPath, attempts };
+    }
+  }
+
+  for (const skipPathRoot of [true, false]) {
+    const text = await tryExportPath(idPath, dbToken, skipPathRoot, `files/export ${idPath}`);
+    if (text) return { text, via: idPath, attempts };
+  }
+
+  for (const skipPathRoot of [true, false]) {
+    const r = await paperDocsDownloadRequest(docId, dbToken, getApiHeaders, asciiSafeJson, rootNamespaceId, { skipPathRoot });
+    attempts.push({ method: `paper/docs/download (${skipPathRoot ? 'no ns' : 'with ns'})`, status: r.status, detail: r.detail });
+    if (r.ok) return { text: r.text, via: `paper/docs/download:${docId}`, attempts };
+  }
+
+  if (contentAccessToken) {
+    for (const skipPathRoot of [true, false]) {
+      const text = await tryExportPath(idPath, contentAccessToken, skipPathRoot, `cap files/export ${idPath}`);
+      if (text) return { text, via: idPath, attempts };
+    }
+    for (const skipPathRoot of [true, false]) {
+      const r = await paperDocsDownloadRequest(docId, contentAccessToken, getApiHeaders, asciiSafeJson, rootNamespaceId, { skipPathRoot });
+      attempts.push({ method: `cap paper/docs/download`, status: r.status, detail: r.detail });
+      if (r.ok) return { text: r.text, via: `cap paper/docs/download:${docId}`, attempts };
+    }
+  }
+
+  return { text: null, via: null, attempts };
+}
+
 /** ログ表示: root 配下の相対パスを path_display のまま返す（path_lower の全面小文字を避ける） */
 function dropboxRelativePathForLog(rootPath, entry) {
   const pl = (entry.path_lower || '').replace(/\/+$/, '');
@@ -881,6 +1028,206 @@ export const useConverter = (
     }
   }, [getApiHeaders, asciiSafeJson, handleDropboxLogout, setStatus, setContent, setCurrentFileName, setCurrentFilePath, setActiveTab, dFetch, transferRawFileToGDrive]);
 
+  const convertGDrivePaperFromDropbox = useCallback(async ({
+    gDriveFileId,
+    gDriveFileName,
+    gDriveParentFolderId,
+  }) => {
+    if (!dbTokenRef.current) {
+      setStatus({ type: 'error', message: 'Dropbox にログインしてください。' });
+      return;
+    }
+    if (!gDriveTokenRef.current) {
+      setStatus({ type: 'error', message: 'Google ドライブにログインしてください。' });
+      return;
+    }
+
+    const convertId = `gdrive-paper-${gDriveFileId}`;
+    setIsGDriveProcessing(true);
+    setExportingId(gDriveFileId);
+    setStatus({ type: 'info', message: `${gDriveFileName} を Paper から変換中...` });
+    log(`Paper 変換開始: ${gDriveFileName}`, 'info', convertId, 0);
+
+    try {
+      const baseFileName = paperBaseName(gDriveFileName);
+      let markdownText = null;
+      let usedSource = null;
+
+      // 1) GDrive 上の .paper 本体（JSON ショートカット）を読む
+      const gRes = await gFetch(
+        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(gDriveFileId)}?alt=media&supportsAllDrives=true`
+      );
+      if (!gRes.ok) {
+        throw new Error('Google ドライブから .paper ファイルを読み取れませんでした');
+      }
+      const shortcutText = await gRes.text();
+      const shortcut = parsePaperShortcutFile(shortcutText);
+      log(shortcut ? `Paper ショートカット検出: ${shortcut.url}` : 'Paper ショートカット形式ではありません', 'info', convertId, 15);
+
+      if (shortcut?.docId) {
+        if (import.meta.env.VITE_USE_NATIVE_ENGINE === 'true') {
+          const exportRes = await fetch('/api/engine/paper/export-shortcut', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              doc_id: shortcut.docId,
+              cloud_docs_url: shortcut.url,
+              file_name: gDriveFileName,
+              file_id_gid: shortcut.fileIdGid,
+              content_access_token: shortcut.contentAccessToken,
+              dropbox_token: dbTokenRef.current,
+              dropbox_refresh_token:
+                typeof localStorage !== 'undefined'
+                  ? localStorage.getItem('dropbox_refresh_token')
+                  : null,
+              dropbox_ns_id: rootNamespaceId || null,
+            }),
+          });
+          const exportRaw = await exportRes.text();
+          let exportData = null;
+          try {
+            exportData = exportRaw ? JSON.parse(exportRaw) : null;
+          } catch {
+            throw new Error(
+              `Paper export API エラー (HTTP ${exportRes.status})${exportRaw ? `: ${exportRaw.slice(0, 200)}` : ''}`
+            );
+          }
+          if (exportData.ok && exportData.markdown) {
+            markdownText = exportData.markdown;
+            usedSource = exportData.via || shortcut.url;
+          } else if (exportData.attempts?.length) {
+            console.warn('[Paper shortcut export attempts]', exportData.attempts);
+            log(
+              `Paper export 試行: ${exportData.attempts.map((a) => `${a.method}=${a.status}`).join(', ')}`,
+              'info',
+              convertId,
+              25
+            );
+          }
+        } else {
+          const browserExport = await exportPaperFromShortcutInBrowser(
+            shortcut,
+            dbTokenRef.current,
+            getApiHeaders,
+            asciiSafeJson,
+            rootNamespaceId
+          );
+          if (browserExport.text) {
+            markdownText = browserExport.text;
+            usedSource = browserExport.via;
+          } else if (browserExport.attempts?.length) {
+            console.warn('[Paper shortcut export attempts]', browserExport.attempts);
+          }
+        }
+
+        // デスクトップ API が失敗した場合もブラウザ側の export 経路を試す
+        if (!markdownText && import.meta.env.VITE_USE_NATIVE_ENGINE === 'true') {
+          const browserExport = await exportPaperFromShortcutInBrowser(
+            shortcut,
+            dbTokenRef.current,
+            getApiHeaders,
+            asciiSafeJson,
+            rootNamespaceId
+          );
+          if (browserExport.text) {
+            markdownText = browserExport.text;
+            usedSource = browserExport.via;
+          } else if (browserExport.attempts?.length) {
+            console.warn('[Paper shortcut browser fallback attempts]', browserExport.attempts);
+          }
+        }
+      }
+
+      if (!markdownText) {
+        throw new Error(
+          shortcut
+            ? 'Paper ショートカットは読み取れましたが、Dropbox から本文の export に失敗しました。desktop/logs/app_latest.log の export 試行ログを確認してください。'
+            : 'Paper ショートカット（url / content_access_token）を .paper ファイルから読み取れませんでした。'
+        );
+      }
+
+      log(`Dropbox から Paper 取得完了: ${usedSource}`, 'info', convertId, 40);
+      const textToSave = cleanMarkdown(markdownText);
+      const docxBlob = await generateDocxBlob(baseFileName, textToSave, dbTokenRef.current);
+
+      const metadata = {
+        name: baseFileName,
+        mimeType: 'application/vnd.google-apps.document',
+        parents: gDriveParentFolderId && gDriveParentFolderId !== 'root' ? [gDriveParentFolderId] : [],
+      };
+
+      const form = new FormData();
+      form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+      form.append('file', docxBlob);
+
+      const uploadRes = await gUpload(
+        'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true',
+        form,
+        null,
+        convertId,
+        [50, 95],
+        docxBlob.size || 0,
+        { metadata, fileBlob: docxBlob, filename: baseFileName }
+      );
+
+      if (!uploadRes.ok) {
+        let detail = '';
+        try {
+          detail = await uploadRes.text();
+        } catch {
+          /* ignore */
+        }
+        throw new Error(detail ? `Google ドキュメント作成失敗: ${detail.slice(0, 200)}` : 'Google ドキュメントの作成に失敗しました');
+      }
+
+      const upData = await uploadRes.json();
+      if (upData.id) {
+        try {
+          await convertTaskMarkersToNativeChecklists(upData.id, gDriveTokenRef.current);
+        } catch (e) {
+          console.warn('[GDoc] チェックリスト API 後処理:', e?.message || e);
+        }
+      }
+
+      const deleted = await gDriveDeleteFile(gDriveFileId);
+      const gDrivePath = (gDriveBrowserPath?.length > 0
+        ? gDriveBrowserPath.map((p) => (p.name === 'Home' ? 'マイドライブ' : p.name)).join('/')
+        : 'フォルダ') + '/' + baseFileName;
+      log(
+        deleted
+          ? `Paper 変換完了（元ファイル削除）: ${gDrivePath}`
+          : `Paper 変換完了（元ファイル削除失敗）: ${gDrivePath}`,
+        deleted ? 'success' : 'warning',
+        convertId,
+        100
+      );
+      setStatus({ type: 'success', message: `Google ドキュメントに変換しました: ${baseFileName}` });
+      if (fetchGDriveContents && gDriveParentFolderId) {
+        fetchGDriveContents(gDriveParentFolderId);
+      }
+    } catch (err) {
+      setStatus({ type: 'error', message: err.message || 'Paper 変換に失敗しました' });
+      log(`Paper 変換失敗: ${gDriveFileName} — ${err.message || '不明なエラー'}`, 'error', convertId, 100);
+    } finally {
+      setIsGDriveProcessing(false);
+      setExportingId(null);
+    }
+  }, [
+    gDriveBrowserPath,
+    getApiHeaders,
+    asciiSafeJson,
+    handleDropboxLogout,
+    setStatus,
+    fetchGDriveContents,
+    dbTokenRef,
+    gDriveTokenRef,
+    dFetch,
+    log,
+    gFetch,
+    refreshDropboxToken,
+    rootNamespaceId,
+  ]);
+
   const saveToGoogleDocs = useCallback(async (content, currentFileName) => {
     if (!content || !gDriveTokenRef.current) return;
 
@@ -1615,6 +1962,7 @@ export const useConverter = (
     isGDriveProcessing,
     exportingId,
     fetchAndExport,
+    convertGDrivePaperFromDropbox,
     saveToGoogleDocs,
     bulkSaveToGoogleDocs,
     migrateFolderRecursively,

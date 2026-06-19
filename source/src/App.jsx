@@ -4,7 +4,7 @@ import { Files, Home, RefreshCw, ShieldCheck, ExternalLink, Folder, HardDrive, C
 // Hooks
 import { useDropbox } from './hooks/useDropbox';
 import { useGoogleDrive } from './hooks/useGoogleDrive';
-import { useConverter } from './hooks/useConverter';
+import { useConverter, isGDrivePaperCandidate } from './hooks/useConverter';
 import { generateCodeVerifier, generateCodeChallenge } from './utils/pkce';
 // Components
 import { Sidebar } from './components/Sidebar';
@@ -1078,21 +1078,36 @@ const App = () => {
                     }
                     items={gdrive.gDriveBrowserFiles}
                     emptyIcon={HardDrive}
-                    renderItem={(f, idx) => (
-                      <FileListItem
-                        key={f.id}
-                        item={f}
-                        isFolder={f.mimeType === 'application/vnd.google-apps.folder'}
-                        onItemClick={() => gdrive.navigateGDriveBrowser(f.id, f.name)}
-                        showExternalLink={f.mimeType !== 'application/vnd.google-apps.folder'}
-                        externalLink={f.webViewLink}
-                        onRename={(newName) => gdrive.renameGDriveFolder(f.id, newName, gdrive.gDriveBrowserPath[gdrive.gDriveBrowserPath.length - 1].id)}
-                        showDuplicateButton={f.mimeType === 'application/vnd.google-apps.folder' && !f.isRoot && !f.isSharedDrive}
-                        onDuplicateClick={() => gdrive.duplicateGDriveFolder(f.id, f.name, gdrive.gDriveBrowserPath[gdrive.gDriveBrowserPath.length - 1].id)}
-                        type="gdrive"
-                        accessLevel={deriveGDriveAccess(f)}
-                      />
-                    )}
+                    renderItem={(f, idx) => {
+                      const gDriveFolderId = gdrive.gDriveBrowserPath[gdrive.gDriveBrowserPath.length - 1]?.id;
+                      const canConvertPaper = isGDrivePaperCandidate(f)
+                        && gDriveFolderId
+                        && gDriveFolderId !== 'home'
+                        && !!dropbox.dbToken
+                        && deriveGDriveAccess(f) === 'full';
+                      return (
+                        <FileListItem
+                          key={f.id}
+                          item={f}
+                          isFolder={f.mimeType === 'application/vnd.google-apps.folder'}
+                          onItemClick={() => gdrive.navigateGDriveBrowser(f.id, f.name)}
+                          showExternalLink={f.mimeType !== 'application/vnd.google-apps.folder'}
+                          externalLink={f.webViewLink}
+                          onRename={(newName) => gdrive.renameGDriveFolder(f.id, newName, gdrive.gDriveBrowserPath[gdrive.gDriveBrowserPath.length - 1].id)}
+                          showDuplicateButton={f.mimeType === 'application/vnd.google-apps.folder' && !f.isRoot && !f.isSharedDrive}
+                          onDuplicateClick={() => gdrive.duplicateGDriveFolder(f.id, f.name, gdrive.gDriveBrowserPath[gdrive.gDriveBrowserPath.length - 1].id)}
+                          showPaperConvertButton={canConvertPaper}
+                          isPaperConverting={converter.exportingId === f.id}
+                          onPaperConvertClick={() => converter.convertGDrivePaperFromDropbox({
+                            gDriveFileId: f.id,
+                            gDriveFileName: f.name,
+                            gDriveParentFolderId: gDriveFolderId,
+                          })}
+                          type="gdrive"
+                          accessLevel={deriveGDriveAccess(f)}
+                        />
+                      );
+                    }}
                     infoBar={gdrive.gDriveToken ? (
                       <>
                         <button

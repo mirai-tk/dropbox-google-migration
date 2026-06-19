@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Folder, FileType, FileText, Check, ChevronRight, ArrowRight, ExternalLink, Home, HardDrive, FolderPlus, Pencil, X, Loader2, CloudUpload, Copy } from 'lucide-react';
+import { Folder, FileType, FileText, Check, ChevronRight, ArrowRight, ExternalLink, Home, HardDrive, FolderPlus, Pencil, X, Loader2, CloudUpload, Copy, FileInput } from 'lucide-react';
 import { formatFileSize } from '../utils/formatFileSize';
 import { shouldIgnoreEnterForSubmit } from '../utils/imeEnter';
 
@@ -17,6 +17,9 @@ export const FileListItem = ({
   onRecursiveMigrateClick,
   showDuplicateButton = false,
   onDuplicateClick,
+  showPaperConvertButton = false,
+  onPaperConvertClick,
+  isPaperConverting = false,
   showExternalLink = false,
   externalLink,
   onRename, // async function(newName) returns boolean
@@ -32,6 +35,7 @@ export const FileListItem = ({
   const [isRenameSaving, setIsRenameSaving] = useState(false);
   const [isRecursiveMigrating, setIsRecursiveMigrating] = useState(false);
   const [isDuplicating, setIsDuplicating] = useState(false);
+  const [isPaperConvertingLocal, setIsPaperConvertingLocal] = useState(false);
   const inputRef = useRef(null);
   const itemStableId = item.path_lower ?? item.id;
 
@@ -106,6 +110,19 @@ export const FileListItem = ({
         await onRecursiveMigrateClick();
       } finally {
         setIsRecursiveMigrating(false);
+      }
+    }
+  };
+
+  const handlePaperConvert = async (e) => {
+    e.stopPropagation();
+    if (blocked) return;
+    if (onPaperConvertClick && !isPaperConverting && !isPaperConvertingLocal) {
+      setIsPaperConvertingLocal(true);
+      try {
+        await onPaperConvertClick();
+      } finally {
+        setIsPaperConvertingLocal(false);
       }
     }
   };
@@ -279,6 +296,16 @@ export const FileListItem = ({
             className="opacity-0 group-hover:opacity-100 p-1.5 hover:bg-indigo-100 rounded-md text-indigo-500 transition-all font-bold"
           >
             <ArrowRight size={14} />
+          </button>
+        )}
+        {!isFolder && showPaperConvertButton && onPaperConvertClick && !blocked && (
+          <button
+            onClick={handlePaperConvert}
+            disabled={isPaperConverting || isPaperConvertingLocal}
+            className="opacity-0 group-hover:opacity-100 p-1.5 hover:bg-emerald-100 rounded-md text-emerald-600 transition-all font-bold disabled:opacity-50"
+            title="Dropbox から Paper を取得して Google ドキュメントに変換"
+          >
+            {(isPaperConverting || isPaperConvertingLocal) ? <Loader2 size={14} className="animate-spin" /> : <FileInput size={14} strokeWidth={2.5} />}
           </button>
         )}
         {!isFolder && showExternalLink && externalLink && !blocked && (
