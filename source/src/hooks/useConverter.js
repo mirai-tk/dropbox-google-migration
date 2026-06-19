@@ -505,32 +505,59 @@ export const useConverter = (
     }
   };
 
-  const dFetch = async (url, options = {}, retry = true) => {
-    let response = await fetch(url, {
-      ...options,
-      headers: {
-        ...options.headers,
-        'Authorization': `Bearer ${dbTokenRef.current}`
-      }
-    });
+  const DROPBOX_TRANSIENT_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+  const DROPBOX_FETCH_MAX_ATTEMPTS = 6;
+  const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
-    if (response.status === 401 && retry && refreshDropboxToken) {
-      console.log('[useConverter] Dropbox token expired, refreshing...');
+  const dFetch = async (url, options = {}, retry = true) => {
+    let lastResponse = null;
+    for (let attempt = 0; attempt < DROPBOX_FETCH_MAX_ATTEMPTS; attempt++) {
+      let response;
       try {
-        const newToken = await refreshDropboxToken();
-        // Retry with new token
         response = await fetch(url, {
           ...options,
           headers: {
             ...options.headers,
-            'Authorization': `Bearer ${newToken}`
+            'Authorization': `Bearer ${dbTokenRef.current}`
           }
         });
       } catch (err) {
-        console.error('[useConverter] Dropbox token refresh failed:', err);
+        if (attempt >= DROPBOX_FETCH_MAX_ATTEMPTS - 1) throw err;
+        const delayMs = Math.min(2000 * (2 ** attempt), 60000);
+        await sleepMs(delayMs);
+        continue;
       }
+
+      if (response.status === 401 && retry && refreshDropboxToken) {
+        console.log('[useConverter] Dropbox token expired, refreshing...');
+        try {
+          const newToken = await refreshDropboxToken();
+          response = await fetch(url, {
+            ...options,
+            headers: {
+              ...options.headers,
+              'Authorization': `Bearer ${newToken}`
+            }
+          });
+        } catch (err) {
+          console.error('[useConverter] Dropbox token refresh failed:', err);
+        }
+      }
+
+      lastResponse = response;
+      if (response.ok || !DROPBOX_TRANSIENT_STATUSES.has(response.status)) {
+        return response;
+      }
+      if (attempt >= DROPBOX_FETCH_MAX_ATTEMPTS - 1) break;
+      const retryAfter = response.headers.get('Retry-After');
+      let delayMs = Math.min(2000 * (2 ** attempt), 60000);
+      if (retryAfter) {
+        const parsed = parseFloat(retryAfter);
+        if (!Number.isNaN(parsed)) delayMs = Math.max(delayMs, parsed * 1000);
+      }
+      await sleepMs(delayMs);
     }
-    return response;
+    return lastResponse;
   };
 
   // fetch + Streams APIでDropboxダウンロード（リアルタイム進捗・Content-Lengthがある場合）

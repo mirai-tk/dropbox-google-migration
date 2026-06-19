@@ -38,6 +38,8 @@ _MIGRATION_STOP_FLAGS: dict[str, asyncio.Event] = {}
 
 # 軽いファイルの同時処理数（1GB 以下の resumable もここに含めて並列化）
 MIGRATION_POOL_SIZE = 5
+# Paper export は Dropbox 側でレート制限されやすいため別レーンで同時数を抑える
+PAPER_EXPORT_MAX_CONCURRENT = 2
 # これを超える通常ファイルは Dropbox ストリーム → GDrive resumable（フルバッファを避ける）
 STREAMING_MIGRATION_MIN_BYTES = 80 * 1024 * 1024
 # 1GB 超の通常ファイルは専用レーンで最大 2 件まで並列
@@ -1156,6 +1158,7 @@ async def run_folder_migration(
     
             sem = asyncio.Semaphore(MIGRATION_POOL_SIZE)
             large_sem = asyncio.Semaphore(SERIAL_MIGRATION_POOL_SIZE)
+            paper_export_sem = asyncio.Semaphore(PAPER_EXPORT_MAX_CONCURRENT)
 
             async def process_file(file: dict) -> None:
                 nonlocal completed
@@ -1344,130 +1347,131 @@ async def run_folder_migration(
                                 return
     
                         if is_paper:
-                            await set_dl(5)
-                            r = await dropbox_request_with_token_refresh(
-                                client,
-                                dropbox_token_ref,
-                                d_refresh,
-                                lambda tok: client.post(
-                                    "https://content.dropboxapi.com/2/files/export",
-                                    headers={
-                                        **dropbox_headers(
-                                            tok, True, dropbox_ns_id
-                                        ),
-                                        "Dropbox-API-Arg": ascii_safe_json(
-                                            {
-                                                "path": path_lower,
-                                                "export_format": "markdown",
-                                            }
-                                        ),
-                                    },
-                                ),
-                            )
-                            if not r.is_success:
-                                logger.error(
-                                    "Paper export failed path=%s status=%s body=%s",
-                                    path_lower,
-                                    r.status_code,
-                                    (r.text or "")[:8000],
-                                )
-                                await event_q.put(
-                                    {
-                                        "type": "log",
-                                        "id": file_log_id,
-                                        "message": f"Paperエクスポート失敗: {rel}",
-                                        "progress": 100,
-                                        "level": "error",
-                                    }
-                                )
-                                return
-                            await set_dl(25)
-                            md = clean_markdown(r.text)
-                            await set_dl(45)
-                            try:
-                                docx_b = await markdown_to_docx_bytes(
+                            async with paper_export_sem:
+                                await set_dl(5)
+                                r = await dropbox_request_with_token_refresh(
                                     client,
                                     dropbox_token_ref,
                                     d_refresh,
-                                    base_name,
-                                    md,
+                                    lambda tok: client.post(
+                                        "https://content.dropboxapi.com/2/files/export",
+                                        headers={
+                                            **dropbox_headers(
+                                                tok, True, dropbox_ns_id
+                                            ),
+                                            "Dropbox-API-Arg": ascii_safe_json(
+                                                {
+                                                    "path": path_lower,
+                                                    "export_format": "markdown",
+                                                }
+                                            ),
+                                        },
+                                    ),
                                 )
-                            except MigrationAuthError:
-                                raise
-                            except Exception:
-                                logger.exception(
-                                    "Paper markdown_to_docx_bytes failed rel=%s", rel
-                                )
-                                await event_q.put(
-                                    {
-                                        "type": "log",
-                                        "id": file_log_id,
-                                        "message": f"Paper docx 生成失敗: {rel}",
-                                        "progress": 100,
-                                        "level": "error",
-                                    }
-                                )
-                                return
-                            await set_dl(80)
-                            meta = gdrive_upload_metadata(
-                                base_name,
-                                "application/vnd.google-apps.document",
-                                g_parent_id,
-                            )
-                            await set_dl(100)
-
-                            async def on_multipart_sent(sent: int, total: int) -> None:
-                                if total <= 0:
+                                if not r.is_success:
+                                    logger.error(
+                                        "Paper export failed path=%s status=%s body=%s",
+                                        path_lower,
+                                        r.status_code,
+                                        (r.text or "")[:8000],
+                                    )
+                                    await event_q.put(
+                                        {
+                                            "type": "log",
+                                            "id": file_log_id,
+                                            "message": f"Paperエクスポート失敗: {rel}",
+                                            "progress": 100,
+                                            "level": "error",
+                                        }
+                                    )
                                     return
-                                u = int((sent / total) * 100)
-                                u = min(100, u)
-                                await set_ul(u, sent)
-
-                            uploaded_id = await gdrive_multipart_upload(
-                                client,
-                                token_ref,
-                                g_refresh,
-                                meta,
-                                docx_b,
-                                on_body_progress=on_multipart_sent,
-                            )
-                            if uploaded_id:
+                                await set_dl(25)
+                                md = clean_markdown(r.text)
+                                await set_dl(45)
                                 try:
-                                    await convert_task_markers_to_native_checklists(
-                                        client, token_ref, g_refresh, uploaded_id
+                                    docx_b = await markdown_to_docx_bytes(
+                                        client,
+                                        dropbox_token_ref,
+                                        d_refresh,
+                                        base_name,
+                                        md,
                                     )
                                 except MigrationAuthError:
                                     raise
                                 except Exception:
                                     logger.exception(
-                                        "convert_task_markers_to_native_checklists rel=%s",
+                                        "Paper markdown_to_docx_bytes failed rel=%s", rel
+                                    )
+                                    await event_q.put(
+                                        {
+                                            "type": "log",
+                                            "id": file_log_id,
+                                            "message": f"Paper docx 生成失敗: {rel}",
+                                            "progress": 100,
+                                            "level": "error",
+                                        }
+                                    )
+                                    return
+                                await set_dl(80)
+                                meta = gdrive_upload_metadata(
+                                    base_name,
+                                    "application/vnd.google-apps.document",
+                                    g_parent_id,
+                                )
+                                await set_dl(100)
+
+                                async def on_multipart_sent(sent: int, total: int) -> None:
+                                    if total <= 0:
+                                        return
+                                    u = int((sent / total) * 100)
+                                    u = min(100, u)
+                                    await set_ul(u, sent)
+
+                                uploaded_id = await gdrive_multipart_upload(
+                                    client,
+                                    token_ref,
+                                    g_refresh,
+                                    meta,
+                                    docx_b,
+                                    on_body_progress=on_multipart_sent,
+                                )
+                                if uploaded_id:
+                                    try:
+                                        await convert_task_markers_to_native_checklists(
+                                            client, token_ref, g_refresh, uploaded_id
+                                        )
+                                    except MigrationAuthError:
+                                        raise
+                                    except Exception:
+                                        logger.exception(
+                                            "convert_task_markers_to_native_checklists rel=%s",
+                                            rel,
+                                        )
+                                    await event_q.put(
+                                        {
+                                            "type": "log",
+                                            "id": file_log_id,
+                                            "message": f"Paper変換完了: {rel}",
+                                            "progress": 100,
+                                            "progress_download": 100,
+                                            "progress_upload": 100,
+                                            "level": "success",
+                                        }
+                                    )
+                                else:
+                                    logger.error(
+                                        "Paper GDrive multipart failed (see gdrive_multipart_upload log above) rel=%s",
                                         rel,
                                     )
-                                await event_q.put(
-                                    {
-                                        "type": "log",
-                                        "id": file_log_id,
-                                        "message": f"Paper変換完了: {rel}",
-                                        "progress": 100,
-                                        "progress_download": 100,
-                                        "progress_upload": 100,
-                                        "level": "success",
-                                    }
-                                )
-                            else:
-                                logger.error(
-                                    "Paper GDrive multipart failed (see gdrive_multipart_upload log above) rel=%s",
-                                    rel,
-                                )
-                                await event_q.put(
-                                    {
-                                        "type": "log",
-                                        "id": file_log_id,
-                                        "message": f"Paperアップロード失敗: {rel}",
-                                        "progress": 100,
-                                        "level": "error",
-                                    }
-                                )
+                                    await event_q.put(
+                                        {
+                                            "type": "log",
+                                            "id": file_log_id,
+                                            "message": f"Paperアップロード失敗: {rel}",
+                                            "progress": 100,
+                                            "level": "error",
+                                        }
+                                    )
                         else:
                             fsize = int(file.get("size") or 0)
                             ext = (

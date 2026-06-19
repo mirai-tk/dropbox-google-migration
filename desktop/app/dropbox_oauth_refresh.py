@@ -21,6 +21,14 @@ def _dropbox_http_is_transient(status: int) -> bool:
     return status in DROPBOX_TRANSIENT_HTTP_CODES
 
 
+async def _drain_dropbox_response(r: httpx.Response) -> None:
+    """リトライ前にボディを読み切り、接続をプールに返す（未読のままだと枯渇しやすい）。"""
+    try:
+        await r.aread()
+    except Exception:
+        pass
+
+
 async def refresh_dropbox_access_token(
     client: httpx.AsyncClient,
     token_ref: list[str],
@@ -71,11 +79,48 @@ async def dropbox_request_with_token_refresh(
 ) -> httpx.Response:
     last_r: httpx.Response | None = None
     for attempt in range(max_attempts):
-        r = await do(token_ref[0])
+        try:
+            r = await do(token_ref[0])
+        except httpx.TransportError as e:
+            if attempt >= max_attempts - 1:
+                logger.error(
+                    "Dropbox API transport failed after %d attempts: %s",
+                    max_attempts,
+                    e,
+                )
+                raise
+            delay = min(2.0 * (2**attempt), 60.0)
+            logger.warning(
+                "Dropbox API transport error, retry %d/%d: %s",
+                attempt + 1,
+                max_attempts,
+                e,
+            )
+            await asyncio.sleep(delay)
+            continue
+
         if r.status_code == 401 and refresh and await refresh_dropbox_access_token(
             client, token_ref, refresh
         ):
-            r = await do(token_ref[0])
+            await _drain_dropbox_response(r)
+            try:
+                r = await do(token_ref[0])
+            except httpx.TransportError as e:
+                if attempt >= max_attempts - 1:
+                    logger.error(
+                        "Dropbox API transport failed after token refresh: %s", e
+                    )
+                    raise
+                delay = min(2.0 * (2**attempt), 60.0)
+                logger.warning(
+                    "Dropbox API transport error after refresh, retry %d/%d: %s",
+                    attempt + 1,
+                    max_attempts,
+                    e,
+                )
+                await asyncio.sleep(delay)
+                continue
+
         if r.status_code == 401:
             raise MigrationAuthError(
                 "Dropbox の認証が無効です（アクセストークンの更新に失敗しました）。"
@@ -84,6 +129,7 @@ async def dropbox_request_with_token_refresh(
         if r.is_success or not _dropbox_http_is_transient(r.status_code):
             return r
         last_r = r
+        await _drain_dropbox_response(r)
         if attempt >= max_attempts - 1:
             break
         delay = min(2.0 * (2**attempt), 60.0)
