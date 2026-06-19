@@ -26,9 +26,18 @@ export const useGoogleDrive = (setStatus, refreshAccessToken = null) => {
   const [isGDriveProcessing, setIsGDriveProcessing] = useState(false);
 
   const gDriveTokenRef = useRef(gDriveToken);
+  const gDriveBrowserPathRef = useRef(gDriveBrowserPath);
+  const isFolderPickerOpenRef = useRef(isFolderPickerOpen);
+  const createFolderInFlightRef = useRef(false);
   useEffect(() => {
     gDriveTokenRef.current = gDriveToken;
   }, [gDriveToken]);
+  useEffect(() => {
+    gDriveBrowserPathRef.current = gDriveBrowserPath;
+  }, [gDriveBrowserPath]);
+  useEffect(() => {
+    isFolderPickerOpenRef.current = isFolderPickerOpen;
+  }, [isFolderPickerOpen]);
 
   useEffect(() => {
     if (gDriveToken) {
@@ -194,7 +203,9 @@ export const useGoogleDrive = (setStatus, refreshAccessToken = null) => {
   }, [pickerDriveType, fetchGDriveDrives, fetchWithAuth]);
 
   const createGDriveFolder = useCallback(async (token, parentId, name) => {
-    if (!name.trim()) return;
+    const trimmed = (name || '').trim();
+    if (!trimmed || createFolderInFlightRef.current) return;
+    createFolderInFlightRef.current = true;
     setIsGDriveLoading(true);
     try {
       const response = await fetchWithAuth(
@@ -203,7 +214,7 @@ export const useGoogleDrive = (setStatus, refreshAccessToken = null) => {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            name: name,
+            name: trimmed,
             mimeType: 'application/vnd.google-apps.folder',
             parents: parentId === 'root' ? [] : [parentId],
           }),
@@ -216,21 +227,30 @@ export const useGoogleDrive = (setStatus, refreshAccessToken = null) => {
       }
       if (!response.ok) throw new Error('フォルダ作成に失敗しました');
 
-      setStatus({ type: 'success', message: `フォルダ "${name}" を作成しました` });
+      setStatus({ type: 'success', message: `フォルダ "${trimmed}" を作成しました` });
       setIsCreatingFolder(false);
       setNewFolderName('');
 
-      // 再読み込み
-      fetchGDriveContents(parentId);
-      // ピッカー内のフォルダ一覧も更新（必要であれば）
-      fetchGDriveFolders(gDriveTokenRef.current, parentId);
-
+      const browserId =
+        gDriveBrowserPathRef.current[gDriveBrowserPathRef.current.length - 1]?.id ?? 'home';
+      fetchGDriveContents(browserId);
+      if (isFolderPickerOpenRef.current) {
+        fetchGDriveFolders(gDriveTokenRef.current, pickerFolderId);
+      }
     } catch (err) {
       setStatus({ type: 'error', message: err.message });
     } finally {
+      createFolderInFlightRef.current = false;
       setIsGDriveLoading(false);
     }
-  }, [fetchGDriveContents, fetchGDriveFolders, fetchWithAuth, setStatus]);
+  }, [fetchGDriveContents, fetchGDriveFolders, fetchWithAuth, setStatus, pickerFolderId]);
+
+  /** ブラウザ上の「今いる場所」にフォルダを作るときの親 ID（home → root） */
+  const getGDriveBrowserParentId = useCallback(() => {
+    const id = gDriveBrowserPath[gDriveBrowserPath.length - 1]?.id;
+    if (!id || id === 'home') return 'root';
+    return id;
+  }, [gDriveBrowserPath]);
 
   const navigateGDriveBrowserTo = useCallback((index) => {
     const newPath = gDriveBrowserPath.slice(0, index + 1);
@@ -410,6 +430,7 @@ export const useGoogleDrive = (setStatus, refreshAccessToken = null) => {
     duplicateGDriveFolder,
     navigateGDriveBrowserTo,
     navigateGDriveBrowser,
-    navigateToGDriveFolder
+    navigateToGDriveFolder,
+    getGDriveBrowserParentId,
   };
 };

@@ -28,7 +28,7 @@ help:
 	@echo "  make desktop-setup        pyenv local $(PYENV_VERSION) → .venv 作成（無いときだけ）→ pip install"
 	@echo "  make desktop-setup-arm64  Apple Silicon で venv を arm64 付きで作り直し（Rosetta 問題のとき）"
 	@echo "  make desktop-run          デスクトップアプリ起動"
-	@echo "  make desktop-dev          同上 --dev（詳細ログ）"
+	@echo "  make desktop-dev          DEBUG ログ + UI 変更時は起動前に build:desktop（dist 配信）"
 	@echo "  make desktop-build-ui     source-build-desktop と同じ（エイリアス）"
 	@echo "  make desktop-clean-venv   desktop/.venv を削除"
 	@echo "  make desktop-pyinstaller  PyInstaller で .app ビルド（要: pip install 済み venv）"

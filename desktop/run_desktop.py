@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 # Ensure `desktop/` is on path when run as script
 _DESKTOP_ROOT = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_DESKTOP_ROOT)
 if _DESKTOP_ROOT not in sys.path:
     sys.path.insert(0, _DESKTOP_ROOT)
 
@@ -84,6 +87,45 @@ def _check_pydantic_core_arch() -> None:
         sys.exit(1)
 
 
+def _newest_mtime(paths: list[Path]) -> float:
+    latest = 0.0
+    for p in paths:
+        if not p.exists():
+            continue
+        if p.is_file():
+            latest = max(latest, p.stat().st_mtime)
+            continue
+        for f in p.rglob("*"):
+            if f.is_file():
+                latest = max(latest, f.stat().st_mtime)
+    return latest
+
+
+def _ensure_desktop_ui_built_for_dev() -> None:
+    """--dev 時: source/src が dist より新しければ build:desktop する（UI は常に dist 配信）。"""
+    source = Path(_REPO_ROOT) / "source"
+    dist_index = source / "dist" / "index.html"
+    src_dir = source / "src"
+    src_mtime = _newest_mtime([src_dir, source / "index.html", source / "vite.config.js"])
+    dist_mtime = dist_index.stat().st_mtime if dist_index.is_file() else 0.0
+    if src_mtime <= dist_mtime:
+        return
+    if not (source / "node_modules").is_dir():
+        print(
+            "UI ソースが dist より新しいですが node_modules がありません。\n"
+            "  make source-install && make source-build-desktop\n"
+            "を実行してから再起動してください。",
+            file=sys.stderr,
+        )
+        return
+    print("UI ソースが dist より新しいため npm run build:desktop を実行します…", flush=True)
+    subprocess.run(
+        ["npm", "run", "build:desktop"],
+        cwd=source,
+        check=True,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
@@ -91,11 +133,15 @@ def main() -> None:
     parser.add_argument(
         "--dev",
         action="store_true",
-        help="開発モード: アプリログを DEBUG 詳細に（PAPER_MIGRATOR_DEV と同じ。既定は desktop/logs/app_latest.log）",
+        help=(
+            "開発モード: DEBUG ログ + UI ソースが dist より新しければ build:desktop を自動実行"
+            "（ウィンドウは FastAPI が配信する source/dist を表示。HMR は make source-dev-desktop）"
+        ),
     )
     args = parser.parse_args()
     if args.dev:
         os.environ["PAPER_MIGRATOR_DEV"] = "1"
+        _ensure_desktop_ui_built_for_dev()
 
     import app.config  # noqa: F401 — .env を先に読む（create_app 内で開発ログを初期化）
 

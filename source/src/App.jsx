@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Files, Home, FolderOpen, RefreshCw, ShieldCheck, ExternalLink, Folder, HardDrive, ChevronRight } from 'lucide-react';
+import { Files, Home, RefreshCw, ShieldCheck, ExternalLink, Folder, HardDrive, ChevronRight, FolderPlus } from 'lucide-react';
 
 // Hooks
 import { useDropbox } from './hooks/useDropbox';
@@ -1061,6 +1061,21 @@ const App = () => {
                     isLoading={gdrive.gDriveBrowserLoading}
                     loadingText="Google Drive 読み込み中..."
                     scrollContextKey={gdrive.gDriveBrowserPath[gdrive.gDriveBrowserPath.length - 1]?.id ?? 'home'}
+                    actions={
+                      gdrive.gDriveToken ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            gdrive.setIsFolderPickerOpen(false);
+                            gdrive.setIsCreatingFolder(true);
+                          }}
+                          className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 text-white text-[10px] font-black uppercase tracking-widest rounded-xl hover:bg-emerald-700 transition-all shadow-md shadow-emerald-100"
+                        >
+                          <FolderPlus size={14} strokeWidth={2.5} />
+                          新規フォルダ
+                        </button>
+                      ) : null
+                    }
                     items={gdrive.gDriveBrowserFiles}
                     emptyIcon={HardDrive}
                     renderItem={(f, idx) => (
@@ -1080,13 +1095,36 @@ const App = () => {
                     )}
                     infoBar={gdrive.gDriveToken ? (
                       <>
-                        <div className="flex items-center gap-2">
-                          <span className="text-[9px] font-bold text-emerald-600 uppercase">保存先:</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            gdrive.setIsCreatingFolder(false);
+                            gdrive.setIsFolderPickerOpen(true);
+                            gdrive.fetchGDriveFolders(
+                              gdrive.gDriveToken,
+                              gdrive.pickerFolderId || 'root'
+                            );
+                          }}
+                          className="flex items-center gap-2 min-w-0 text-left hover:opacity-80 transition-opacity"
+                          title="保存先フォルダを選択（クリック）"
+                        >
+                          <span className="text-[9px] font-bold text-emerald-600 uppercase shrink-0">保存先:</span>
                           <span className="text-[9px] font-black text-emerald-800 truncate max-w-[150px]">
                             {gdrive.selectedFolderId === 'root' ? 'マイドライブ' : (gdrive.gDriveBrowserPath[gdrive.gDriveBrowserPath.length - 1].name || '現在のフォルダ')}
                           </span>
-                        </div>
+                        </button>
                         <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              gdrive.setIsFolderPickerOpen(false);
+                              gdrive.setIsCreatingFolder(true);
+                            }}
+                            className="p-1 hover:bg-emerald-100 rounded transition-all text-emerald-600"
+                            title="新規フォルダ"
+                          >
+                            <FolderPlus size={10} />
+                          </button>
                           <a
                             href={gdrive.selectedFolderId === 'root' ? 'https://drive.google.com/drive/my-drive' : `https://drive.google.com/drive/folders/${gdrive.selectedFolderId}`}
                             target="_blank"
@@ -1132,7 +1170,7 @@ const App = () => {
                     ) : (
                       <>
                         {/* Inline Folder Creation Overlay */}
-                        {gdrive.isCreatingFolder && (
+                        {gdrive.isCreatingFolder && !gdrive.isFolderPickerOpen && (
                           <div className="p-3 bg-emerald-50 rounded-xl border border-emerald-100 flex flex-col gap-2 mb-2">
                             <input
                               type="text"
@@ -1142,14 +1180,31 @@ const App = () => {
                                 if (e.key !== 'Enter') return;
                                 if (shouldIgnoreEnterForSubmit(e)) return;
                                 e.preventDefault();
-                                gdrive.createGDriveFolder(gdrive.gDriveToken, gdrive.gDriveBrowserPath[gdrive.gDriveBrowserPath.length - 1].id, gdrive.newFolderName);
+                                gdrive.createGDriveFolder(
+                                  gdrive.gDriveToken,
+                                  gdrive.getGDriveBrowserParentId(),
+                                  gdrive.newFolderName
+                                );
                               }}
                               placeholder="フォルダ名を入力..."
                               autoFocus
                               className="w-full bg-white border border-emerald-200 rounded-lg px-2 py-1.5 text-xs focus:outline-none"
                             />
                             <div className="flex gap-2">
-                              <button onClick={() => gdrive.createGDriveFolder(gdrive.gDriveToken, gdrive.gDriveBrowserPath[gdrive.gDriveBrowserPath.length - 1].id, gdrive.newFolderName)} className="flex-1 bg-emerald-600 text-white text-[10px] py-1.5 rounded-lg font-bold">作成</button>
+                              <button
+                                type="button"
+                                disabled={gdrive.isGDriveLoading}
+                                onClick={() =>
+                                  gdrive.createGDriveFolder(
+                                    gdrive.gDriveToken,
+                                    gdrive.getGDriveBrowserParentId(),
+                                    gdrive.newFolderName
+                                  )
+                                }
+                                className="flex-1 bg-emerald-600 text-white text-[10px] py-1.5 rounded-lg font-bold disabled:opacity-50"
+                              >
+                                {gdrive.isGDriveLoading ? '作成中...' : '作成'}
+                              </button>
                               <button onClick={() => gdrive.setIsCreatingFolder(false)} className="px-3 bg-white border border-slate-200 text-slate-400 text-[10px] py-1.5 rounded-lg">キャンセル</button>
                             </div>
                           </div>
@@ -1188,11 +1243,6 @@ const App = () => {
         pickerBreadcrumbs={gdrive.pickerBreadcrumbs}
         gDriveDrives={gdrive.gDriveDrives}
         isGDriveLoading={gdrive.isGDriveLoading}
-        isCreatingFolder={gdrive.isCreatingFolder}
-        setIsCreatingFolder={gdrive.setIsCreatingFolder}
-        newFolderName={gdrive.newFolderName}
-        setNewFolderName={gdrive.setNewFolderName}
-        createGDriveFolder={gdrive.createGDriveFolder}
         navigateToGDriveFolder={gdrive.navigateToGDriveFolder}
         gDriveToken={gdrive.gDriveToken}
       />

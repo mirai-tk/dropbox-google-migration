@@ -1,6 +1,5 @@
 import React from 'react';
-import { FolderOpen, X, ChevronRight, ArrowLeft, FileUp, Loader2, Folder, Check, Building2 } from 'lucide-react';
-import { shouldIgnoreEnterForSubmit } from '../utils/imeEnter';
+import { FolderOpen, X, ChevronRight, ArrowLeft, Loader2, Folder, Check, Building2 } from 'lucide-react';
 
 export const FolderPickerModal = ({
   isOpen,
@@ -15,11 +14,6 @@ export const FolderPickerModal = ({
   pickerBreadcrumbs,
   gDriveDrives,
   isGDriveLoading,
-  isCreatingFolder,
-  setIsCreatingFolder,
-  newFolderName,
-  setNewFolderName,
-  createGDriveFolder,
   navigateToGDriveFolder,
   gDriveToken
 }) => {
@@ -109,15 +103,7 @@ export const FolderPickerModal = ({
               ))}
             </div>
 
-            {!(pickerDriveType === 'shared' && pickerFolderId === 'root') && (
-              <button
-                onClick={() => setIsCreatingFolder(true)}
-                className="p-2 text-slate-400 hover:text-emerald-500 hover:bg-emerald-50 rounded-xl transition-all shrink-0 ml-2"
-                title="新規フォルダ"
-              >
-                <FileUp size={18} strokeWidth={2.5} />
-              </button>
-            )}
+            {/* 新規フォルダは右パネル側のみ。保存先モーダルと二重フォームにしない */}
           </div>
 
           {/* List */}
@@ -129,45 +115,6 @@ export const FolderPickerModal = ({
               </div>
             ) : (
               <div className="flex flex-col gap-1">
-                {isCreatingFolder && (
-                  <div className="p-4 bg-emerald-50 rounded-2xl border border-emerald-100 flex flex-col gap-3 mb-2 animate-in fade-in slide-in-from-top-2">
-                     <div className="flex items-center gap-2">
-                       <div className="w-8 h-8 bg-emerald-500 rounded-lg flex items-center justify-center text-white shrink-0">
-                         <Folder size={18} strokeWidth={2.5} />
-                       </div>
-                       <input
-                         type="text"
-                         value={newFolderName}
-                         onChange={(e) => setNewFolderName(e.target.value)}
-                         onKeyDown={(e) => {
-                           if (e.key !== 'Enter') return;
-                           if (shouldIgnoreEnterForSubmit(e)) return;
-                           e.preventDefault();
-                           createGDriveFolder(gDriveToken, pickerFolderId, newFolderName);
-                         }}
-                         placeholder="フォルダ名を入力..."
-                         autoFocus
-                         className="flex-1 bg-white border border-emerald-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/20 text-slate-700"
-                       />
-                     </div>
-                     <div className="flex gap-2">
-                       <button
-                         onClick={() => createGDriveFolder(gDriveToken, pickerFolderId, newFolderName)}
-                         disabled={!newFolderName.trim() || isGDriveLoading}
-                         className="flex-1 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-[10px] font-black uppercase py-2.5 rounded-xl transition-all"
-                       >
-                         {isGDriveLoading ? '作成中...' : '作成する'}
-                       </button>
-                       <button
-                         onClick={() => { setIsCreatingFolder(false); setNewFolderName(''); }}
-                         className="px-4 bg-white hover:bg-slate-50 text-slate-400 hover:text-slate-600 text-[10px] font-black uppercase py-2.5 rounded-xl border border-slate-200 transition-all"
-                       >
-                         キャンセル
-                       </button>
-                     </div>
-                  </div>
-                )}
-
                 {pickerDriveType === 'shared' && pickerFolderId === 'root' ? (
                   <>
                     <div className="flex items-center justify-between px-2 mb-2">
