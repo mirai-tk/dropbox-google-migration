@@ -87,6 +87,10 @@ RESUMABLE_CHUNK_PUT_TIMEOUT = 600.0
 GDRIVE_TRANSIENT_HTTP_CODES = frozenset({408, 429, 500, 502, 503, 504})
 GDRIVE_MULTIPART_UPLOAD_RETRIES = 5
 RESUMABLE_SESSION_INIT_RETRIES = 5
+# multipart/resumable のレスポンス待ち（read=None だとサーバー無応答時に永久ハングしやすい）
+GDRIVE_UPLOAD_RESPONSE_TIMEOUT = httpx.Timeout(
+    connect=120.0, read=600.0, write=120.0, pool=120.0
+)
 # Dropbox ストリーム切断（RemoteProtocolError）時に resumable パイプライン全体をやり直す回数
 RESUMABLE_FULL_PIPELINE_RETRIES = 8
 # Dropbox 公式フォーラム推奨: 長時間単一接続は ~1h で切れるため Range でチャンク化
@@ -629,7 +633,7 @@ async def gdrive_multipart_upload(
                         "Content-Type": f"multipart/related; boundary={boundary}",
                     },
                     content=stream_body(),
-                    # AsyncClient 側の read=None を尊重（大きい multipart で待ちが長くても切らない）
+                    timeout=GDRIVE_UPLOAD_RESPONSE_TIMEOUT,
                 ),
             )
         except httpx.TransportError as e:
@@ -665,6 +669,10 @@ async def gdrive_multipart_upload(
             attempt + 1,
             GDRIVE_MULTIPART_UPLOAD_RETRIES,
         )
+        try:
+            await r.aread()
+        except Exception:
+            pass
         await asyncio.sleep(delay)
         delay = min(delay * 2, 60.0)
     if r is None or not r.is_success:
@@ -728,6 +736,10 @@ async def _put_resumable_chunk(
             return r
         if attempt >= RESUMABLE_CHUNK_PUT_MAX_ATTEMPTS - 1:
             return r
+        try:
+            await r.aread()
+        except Exception:
+            pass
         logger.info(
             "resumable chunk PUT HTTP %s retry %d/%d",
             r.status_code,
@@ -869,6 +881,10 @@ async def gdrive_resumable_upload_stream(
                 break
             if not _gdrive_http_is_transient(r0.status_code) or attempt >= RESUMABLE_SESSION_INIT_RETRIES - 1:
                 return False
+            try:
+                await r0.aread()
+            except Exception:
+                pass
             logger.info(
                 "resumable session init HTTP %s retry %d/%d",
                 r0.status_code,

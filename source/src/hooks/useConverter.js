@@ -128,32 +128,59 @@ export const useConverter = (
     }
   }, [addLog]);
 
-  const gFetch = async (url, options = {}, retry = true) => {
-    let response = await fetch(url, {
-      ...options,
-      headers: {
-        ...options.headers,
-        'Authorization': `Bearer ${gDriveTokenRef.current}`
-      }
-    });
+  const GAPI_TRANSIENT_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+  const GAPI_FETCH_MAX_ATTEMPTS = 6;
+  const GAPI_UPLOAD_TIMEOUT_MS = 600000;
+  const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
-    if (response.status === 401 && retry && refreshGoogleToken) {
-      console.log('[useConverter] GDrive token expired, refreshing...');
+  const gFetch = async (url, options = {}, retry = true) => {
+    let lastResponse = null;
+    for (let attempt = 0; attempt < GAPI_FETCH_MAX_ATTEMPTS; attempt++) {
+      let response;
       try {
-        const newToken = await refreshGoogleToken();
-        // Retry with new token
         response = await fetch(url, {
           ...options,
           headers: {
             ...options.headers,
-            'Authorization': `Bearer ${newToken}`
+            'Authorization': `Bearer ${gDriveTokenRef.current}`
           }
         });
       } catch (err) {
-        console.error('[useConverter] Token refresh failed:', err);
+        if (attempt >= GAPI_FETCH_MAX_ATTEMPTS - 1) throw err;
+        await sleepMs(Math.min(2000 * (2 ** attempt), 60000));
+        continue;
       }
+
+      if (response.status === 401 && retry && refreshGoogleToken) {
+        console.log('[useConverter] GDrive token expired, refreshing...');
+        try {
+          const newToken = await refreshGoogleToken();
+          response = await fetch(url, {
+            ...options,
+            headers: {
+              ...options.headers,
+              'Authorization': `Bearer ${newToken}`
+            }
+          });
+        } catch (err) {
+          console.error('[useConverter] Token refresh failed:', err);
+        }
+      }
+
+      lastResponse = response;
+      if (response.ok || !GAPI_TRANSIENT_STATUSES.has(response.status)) {
+        return response;
+      }
+      if (attempt >= GAPI_FETCH_MAX_ATTEMPTS - 1) break;
+      const retryAfter = response.headers.get('Retry-After');
+      let delayMs = Math.min(2000 * (2 ** attempt), 60000);
+      if (retryAfter) {
+        const parsed = parseFloat(retryAfter);
+        if (!Number.isNaN(parsed)) delayMs = Math.max(delayMs, parsed * 1000);
+      }
+      await sleepMs(delayMs);
     }
-    return response;
+    return lastResponse;
   };
 
   // Streams APIでmultipartを組み立ててfetch（リアルタイム進捗・Chrome105+等で動作）
@@ -218,12 +245,12 @@ export const useConverter = (
   const GDRIVE_STREAM_UPLOAD_TIMEOUT_MS = 120000; // 2分でタイムアウト→FormDataにフォールバック
   const gUploadWithFetchStream = async (url, metadata, fileBlob, filename, logId, progressRange) => {
     console.log('[GDrive] multipart upload開始 (stream) size=', fileBlob?.size);
-    const { stream, boundary } = createMultipartStream(metadata, fileBlob, filename, (p) => addLog && addLog({ id: logId, progress: p }), progressRange);
-    const doUpload = async (token) => {
+    const doUploadOnce = async (token) => {
+      const { stream, boundary } = createMultipartStream(metadata, fileBlob, filename, (p) => addLog && addLog({ id: logId, progress: p }), progressRange);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => {
         controller.abort();
-        console.warn('[GDrive] stream upload タイムアウト、FormDataで再試行します');
+        console.warn('[GDrive] stream upload タイムアウト');
       }, GDRIVE_STREAM_UPLOAD_TIMEOUT_MS);
       try {
         const res = await fetch(url, {
@@ -236,18 +263,33 @@ export const useConverter = (
           duplex: 'half',
           signal: controller.signal
         });
-        clearTimeout(timeoutId);
         if (res.status === 401 && refreshGoogleToken) {
           const newToken = await refreshGoogleToken();
-          return doUpload(newToken);
+          return doUploadOnce(newToken);
         }
         return res;
-      } catch (e) {
+      } finally {
         clearTimeout(timeoutId);
-        throw e;
       }
     };
-    const res = await doUpload(gDriveTokenRef.current);
+
+    let lastRes = null;
+    for (let attempt = 0; attempt < GAPI_FETCH_MAX_ATTEMPTS; attempt++) {
+      try {
+        lastRes = await doUploadOnce(gDriveTokenRef.current);
+      } catch (err) {
+        if (attempt >= GAPI_FETCH_MAX_ATTEMPTS - 1) throw err;
+        if (logId && addLog) {
+          addLog({ id: logId, detail: `GDrive stream 再試行 ${attempt + 2}/${GAPI_FETCH_MAX_ATTEMPTS}...` });
+        }
+        await sleepMs(Math.min(2000 * (2 ** attempt), 60000));
+        continue;
+      }
+      if (lastRes.ok || !GAPI_TRANSIENT_STATUSES.has(lastRes.status)) break;
+      if (attempt >= GAPI_FETCH_MAX_ATTEMPTS - 1) break;
+      await sleepMs(Math.min(2000 * (2 ** attempt), 60000));
+    }
+    const res = lastRes;
     if (logId && addLog) addLog({ id: logId, progress: progressRange[1] });
     console.log('[GDrive] multipart upload完了 (stream) status=', res?.status);
     try {
@@ -270,23 +312,57 @@ export const useConverter = (
         addLog({ id: logId, progress: progressValue });
       }
     }, 300);
-    try {
-      const doUpload = async (token) => {
+
+    const doUploadOnce = async (token) => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), GAPI_UPLOAD_TIMEOUT_MS);
+      try {
         const res = await fetch(url, {
           method: 'POST',
           headers: {
             Authorization: `Bearer ${token}`,
             ...(contentType && { 'Content-Type': contentType })
           },
-          body
+          body,
+          signal: controller.signal
         });
         if (res.status === 401 && refreshGoogleToken) {
           const newToken = await refreshGoogleToken();
-          return doUpload(newToken);
+          return doUploadOnce(newToken);
         }
         return res;
-      };
-      const res = await doUpload(gDriveTokenRef.current);
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    };
+
+    try {
+      let lastRes = null;
+      for (let attempt = 0; attempt < GAPI_FETCH_MAX_ATTEMPTS; attempt++) {
+        try {
+          lastRes = await doUploadOnce(gDriveTokenRef.current);
+        } catch (err) {
+          if (attempt >= GAPI_FETCH_MAX_ATTEMPTS - 1) throw err;
+          if (logId && addLog) {
+            addLog({
+              id: logId,
+              detail: `GDrive アップロード再試行 ${attempt + 2}/${GAPI_FETCH_MAX_ATTEMPTS}...`
+            });
+          }
+          await sleepMs(Math.min(2000 * (2 ** attempt), 60000));
+          continue;
+        }
+        if (lastRes.ok || !GAPI_TRANSIENT_STATUSES.has(lastRes.status)) break;
+        if (attempt >= GAPI_FETCH_MAX_ATTEMPTS - 1) break;
+        if (logId && addLog) {
+          addLog({
+            id: logId,
+            detail: `GDrive HTTP ${lastRes.status} — 再試行 ${attempt + 2}/${GAPI_FETCH_MAX_ATTEMPTS}...`
+          });
+        }
+        await sleepMs(Math.min(2000 * (2 ** attempt), 60000));
+      }
+      const res = lastRes;
       if (logId && addLog) addLog({ id: logId, progress: max });
       console.log('[GDrive] multipart upload完了 (fetch) status=', res?.status);
       try {
@@ -319,12 +395,13 @@ export const useConverter = (
 
   // Resumable Upload: XHRでLocationヘッダー取得（FetchはCORSで取得不可のため）
   const gDriveResumableInit = async (metadata, fileSize, mimeType) => {
-    const doInit = async (tokenOverride = null) => {
+    const doInitOnce = async (tokenOverride = null) => {
       const token = tokenOverride ?? gDriveTokenRef.current;
       if (!token) throw new Error('Google Drive token required');
       return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open('POST', 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true');
+        xhr.timeout = GAPI_UPLOAD_TIMEOUT_MS;
         xhr.setRequestHeader('Authorization', `Bearer ${token}`);
         xhr.setRequestHeader('Content-Type', 'application/json; charset=UTF-8');
         xhr.setRequestHeader('X-Upload-Content-Length', String(fileSize));
@@ -332,35 +409,47 @@ export const useConverter = (
         xhr.onload = () => {
           if (xhr.status === 401 && refreshGoogleToken) {
             console.log('[useConverter] GDrive token expired (resumable init), refreshing...');
-            refreshGoogleToken().then((newToken) => doInit(newToken).then(resolve).catch(reject)).catch(reject);
+            refreshGoogleToken().then((newToken) => doInitOnce(newToken).then(resolve).catch(reject)).catch(reject);
+            return;
+          }
+          if (GAPI_TRANSIENT_STATUSES.has(xhr.status)) {
+            reject(Object.assign(new Error(`Resumable init transient HTTP ${xhr.status}`), { transient: true, status: xhr.status }));
             return;
           }
           const location = xhr.getResponseHeader('Location');
           if (location) resolve(location);
-          else reject(new Error('Resumable init failed: no Location header'));
+          else reject(new Error(`Resumable init failed: status=${xhr.status}`));
+        };
+        xhr.ontimeout = () => {
+          reject(Object.assign(new Error('Resumable init timeout'), { transient: true }));
         };
         xhr.onerror = () => {
-          if (refreshGoogleToken) {
-            console.log('[useConverter] Resumable init failed (network/CORS), trying token refresh...');
-            refreshGoogleToken().then((newToken) => doInit(newToken).then(resolve).catch(reject)).catch(reject);
-          } else {
-            reject(new Error('Resumable init failed'));
-          }
+          reject(Object.assign(new Error('Resumable init network error'), { transient: true }));
         };
         xhr.send(JSON.stringify(metadata));
       });
     };
-    return doInit();
+
+    for (let attempt = 0; attempt < GAPI_FETCH_MAX_ATTEMPTS; attempt++) {
+      try {
+        return await doInitOnce();
+      } catch (err) {
+        if (!err.transient || attempt >= GAPI_FETCH_MAX_ATTEMPTS - 1) throw err;
+        console.warn(`[Resumable] init 再試行 ${attempt + 2}/${GAPI_FETCH_MAX_ATTEMPTS}: ${err.message}`);
+        await sleepMs(Math.min(2000 * (2 ** attempt), 60000));
+      }
+    }
+    throw new Error('Resumable init failed after retries');
   };
 
   // Resumable Upload: チャンクをPUT（FetchのCORS制限を避けるためXHRを使用）
   const gDriveResumableChunkPut = async (uri, chunk, rangeStart, rangeEnd, totalSize) => {
     let token = gDriveTokenRef.current;
-    const doPut = () => {
+    const doPutOnce = () => {
       return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         const putStartTime = Date.now();
-        xhr.timeout = 300000; // 5分（最終チャンクでハング検知用）
+        xhr.timeout = GAPI_UPLOAD_TIMEOUT_MS;
         xhr.open('PUT', uri);
         xhr.setRequestHeader('Authorization', `Bearer ${token}`);
         xhr.setRequestHeader('Content-Range', `bytes ${rangeStart}-${rangeEnd - 1}/${totalSize}`);
@@ -371,8 +460,12 @@ export const useConverter = (
             console.log('[useConverter] GDrive token expired (chunk PUT), refreshing...');
             refreshGoogleToken().then((newToken) => {
               token = newToken;
-              doPut().then(resolve).catch(reject);
+              doPutOnce().then(resolve).catch(reject);
             }).catch(reject);
+            return;
+          }
+          if (GAPI_TRANSIENT_STATUSES.has(xhr.status)) {
+            reject(Object.assign(new Error(`Chunk PUT transient HTTP ${xhr.status}`), { transient: true, status: xhr.status }));
             return;
           }
           if (xhr.status !== 200 && xhr.status !== 201 && xhr.status !== 308) {
@@ -381,23 +474,27 @@ export const useConverter = (
           resolve({ ok: xhr.status === 200 || xhr.status === 201 || xhr.status === 308, status: xhr.status, json: () => Promise.resolve(xhr.response || {}) });
         };
         xhr.ontimeout = () => {
-          console.warn(`[Resumable] Chunk PUT タイムアウト elapsed=${((Date.now() - putStartTime) / 1000).toFixed(1)}s`);
+          const elapsed = ((Date.now() - putStartTime) / 1000).toFixed(1);
+          console.warn(`[Resumable] Chunk PUT タイムアウト elapsed=${elapsed}s`);
+          reject(Object.assign(new Error('Resumable chunk PUT timeout'), { transient: true }));
         };
         xhr.onerror = () => {
-          if (refreshGoogleToken) {
-            console.log('[useConverter] Chunk PUT failed (network/CORS), trying token refresh...');
-            refreshGoogleToken().then((newToken) => {
-              token = newToken;
-              doPut().then(resolve).catch(reject);
-            }).catch(reject);
-          } else {
-            reject(new Error('Resumable chunk PUT failed'));
-          }
+          reject(Object.assign(new Error('Resumable chunk PUT network error'), { transient: true }));
         };
         xhr.send(chunk);
       });
     };
-    return doPut();
+
+    for (let attempt = 0; attempt < GAPI_FETCH_MAX_ATTEMPTS; attempt++) {
+      try {
+        return await doPutOnce();
+      } catch (err) {
+        if (!err.transient || attempt >= GAPI_FETCH_MAX_ATTEMPTS - 1) throw err;
+        console.warn(`[Resumable] Chunk PUT 再試行 ${attempt + 2}/${GAPI_FETCH_MAX_ATTEMPTS}: ${err.message}`);
+        await sleepMs(Math.min(2000 * (2 ** attempt), 60000));
+      }
+    }
+    throw new Error('Resumable chunk PUT failed after retries');
   };
 
   // 400MB超: Dropboxからストリーム読み取り→GDrive Resumableで分割アップロード
@@ -507,7 +604,6 @@ export const useConverter = (
 
   const DROPBOX_TRANSIENT_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
   const DROPBOX_FETCH_MAX_ATTEMPTS = 6;
-  const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
   const dFetch = async (url, options = {}, retry = true) => {
     let lastResponse = null;
